@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#12100E" />
+<title>Battle River — Chat Selling Script</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<style>
+  body { font-family: 'Inter', sans-serif; background: #12100E; -webkit-tap-highlight-color: transparent; }
+  .font-display { font-family: 'Space Grotesk', sans-serif; }
+  .font-mono { font-family: 'IBM Plex Mono', monospace; }
+  @keyframes flash { 0% { opacity: 0; transform: translateY(6px); } 15% { opacity: 1; transform: translateY(0); } 85% { opacity: 1; } 100% { opacity: 0; } }
+  .flash { animation: flash 1.6s ease forwards; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+(function () {
+"use strict";
+var h = React.createElement;
+var useState = React.useState, useEffect = React.useEffect;
+
+var C = {
+  bg: "#12100E", surface: "#1C1917", surfaceAlt: "#242019",
+  ember: "#E8622C", emberSoft: "#FF9A5A", emberDim: "#7A3418",
+  text: "#F5F0EA", muted: "#A39A92", line: "#332E2A", good: "#5CB874"
+};
+
+var STAGES = {
+  approach: { label: "Initial Approach", color: C.emberSoft },
+  relationship: { label: "Relationship Touch", color: C.emberSoft },
+  prospect: { label: "New Prospect", color: C.ember },
+  appointment: { label: "Appointment Set", color: C.ember },
+  presented: { label: "Client Presented", color: C.ember },
+  closing: { label: "Client Closed", color: C.good }
+};
+
+var STEPS = {
+  start: {
+    stage: "approach",
+    title: "The opener",
+    note: "Use this AFTER your Genuine Connection approach — never cold.",
+    scripts: ["Hello {name}, Naisip kita:) Ask ko lang sana kung meron kana yearly payout? Hehe Thank youuuu! \u263A"],
+    choices: [
+      { label: "\u201CAno yung yearly payout?\u201D / \u201CWala pa eh\u201D", next: "explain_payout" },
+      { label: "\u201CYes meron na.\u201D", next: "has_plan" },
+      { label: "Seen / walang reply", next: "seen_opener" }
+    ]
+  },
+
+  explain_payout: {
+    stage: "relationship",
+    title: "Explain the yearly payout",
+    note: "One sentence. Lead with the benefit, hindi yung product name.",
+    scripts: ["Bale traditional plan siya na after 6 years nag bibigay sayo ng yearly pension until age 100"],
+    choices: [{ label: "Next \u2014 ask for details", next: "ask_details" }]
+  },
+
+  has_plan: {
+    stage: "relationship",
+    title: "May plan na siya",
+    scripts: ["Niceee, ayos yan hehe. Thank you for having one as early as now! Saang Insurance company ka pala kumuha? Hehe"],
+    choices: [
+      { label: "Sun Life yung current plan", next: "pass_sunlife" },
+      { label: "Ibang company", next: "other_company" }
+    ]
+  },
+
+  pass_sunlife: {
+    stage: "relationship",
+    title: "Pass na agad",
+    note: "Kapag Sun Life yung current plan, hindi na ineentertain \u2014 pass na agad. Keep the relationship warm, move on to the next prospect.",
+    scripts: [],
+    choices: [{ label: "Back to start", next: "start" }]
+  },
+
+  other_company: {
+    stage: "relationship",
+    title: "Ibang company",
+    note: "Alamin yung plan na meron siya. Kung VUL yung hawak niya, ialok mo ang SFW.",
+    scripts: [],
+    choices: [{ label: "Proceed \u2014 offer sample plan", next: "ask_details" }]
+  },
+
+  seen_opener: {
+    stage: "approach",
+    title: "Seen zone \u2014 follow up",
+    note: "Chat again after 2 weeks or 1 month until mag reply. Rotate between these two so hindi paulit-ulit.",
+    scripts: [
+      "Hello {name}, Good afternoon! Ask ko lang sana kung meron kana yearly payout? Hehe Thank youuu! \u263A",
+      "Hello {name}, Goodaftie!:) Ask ko lang sana kung meron kana Insurance with investment plan with Sun Life? Hehe Thank youuuu! \u263A"
+    ],
+    choices: [
+      { label: "Nag-reply na siya", next: "start" },
+      { label: "Still seen \u2014 park muna", next: "home" }
+    ]
+  },
+
+  ask_details: {
+    stage: "prospect",
+    title: "Ask for name & birthday",
+    scripts: ["Pwede kita gawan ng sample Life Plan na pasok sa budget mo:) Send mo lang sakin yung full name and birthday mo \u263A"],
+    choices: [
+      { label: "Nagsend ng name at birthday", next: "got_details" },
+      { label: "Seen / hindi pa nagsend", next: "chase_details" }
+    ]
+  },
+
+  chase_details: {
+    stage: "prospect",
+    title: "Chase the details",
+    note: "Cold market: weekly. Warm market: daily. Follow up until magsend.",
+    scripts: [
+      "Hello {name}, kamusta? If ever hindi kana busy send mo na sa akin yung full name at bday mo ah para magawan na kita ng quotation hehe. Thank you! \u263A",
+      "Hello {name}, kamusta? If ever hindi kana busy beke nemen pwede mo na send sa akin yung full name at bday mo ah para magawan na kita ng quotation hehe. Thank you! \u263A"
+    ],
+    choices: [
+      { label: "Nagsend na", next: "got_details" },
+      { label: "Wala pa \u2014 park muna", next: "home" }
+    ]
+  },
+
+  got_details: {
+    stage: "prospect",
+    title: "Confirm you're making the quotation",
+    scripts: ["Ayun! Thank you sige gawan lang kita ng quotation tapos send and discuss ko sayo quickly online ha"],
+    choices: [{ label: "Next \u2014 set the appointment", next: "appt_day" }]
+  },
+
+  appt_day: {
+    stage: "appointment",
+    title: "Appointment \u2014 weekend or weekday?",
+    note: "Never ask \u201Cpwede ba tayo mag-meet?\u201D \u2014 that's a yes/no. Always give two options.",
+    scripts: [
+      "Hi {name}:) Kailan ka pwede for a quick online meeting:) weekends or weekdays?",
+      "Hi {name}:) Nagawa ko na yung sample Life Plan mo with Sun Life:) Kailan ka pwede for a quick online meeting:) Weekends or weekdays?"
+    ],
+    choices: [
+      { label: "Sabi niya weekdays", next: "appt_weekday" },
+      { label: "Sabi niya weekends", next: "appt_weekend" },
+      { label: "Seen / walang sagot", next: "chase_appt" }
+    ]
+  },
+
+  appt_weekday: {
+    stage: "appointment",
+    title: "Narrow the day",
+    scripts: ["Monday or Tuesday? (Depende sa availability mo)"],
+    choices: [{ label: "Next \u2014 lock the time", next: "appt_time" }]
+  },
+
+  appt_weekend: {
+    stage: "appointment",
+    title: "Narrow the day",
+    scripts: ["Saturday or Sunday?"],
+    choices: [{ label: "Next \u2014 lock the time", next: "appt_time" }]
+  },
+
+  appt_time: {
+    stage: "appointment",
+    title: "Lock the time",
+    scripts: ["10 AM or 11 AM?", "7 pm or 8 pm?"],
+    choices: [{ label: "Next \u2014 confirm it", next: "appt_confirm" }]
+  },
+
+  appt_confirm: {
+    stage: "appointment",
+    title: "Confirm the appointment",
+    note: "State it back as a done deal. \u201CQuick 15 mins\u201D lowers the cost of saying yes. Palitan yung day/time ng napagkasunduan.",
+    scripts: ["Okay:) See you {name} Monday, 7 pm via online for our quick 15 mins meeting ha:)"],
+    choices: [{ label: "Meeting done \u2014 present the plan", next: "present_intro" }]
+  },
+
+  chase_appt: {
+    stage: "appointment",
+    title: "Chase the appointment",
+    note: "Follow up until mag reply. Pwede ka rin mag-reply sa posts/stories niya sa IG at FB para mag-warm ulit.",
+    scripts: [
+      "Hi {name}? If ever may questions ka pa dun sa Life Plan mo kindly let me know ah para mapush na natin yung application ng plan mo hehe.",
+      "{name}, push na natin plan mooo para mag start na din yung yearly pension mo asap:)"
+    ],
+    choices: [
+      { label: "Nag-reply na", next: "appt_day" },
+      { label: "Wala pa \u2014 park muna", next: "home" }
+    ]
+  },
+
+  present_intro: {
+    stage: "presented",
+    title: "Send the quotation",
+    note: "Send the quotation image first, then these two lines.",
+    scripts: [
+      "Bali eto na pala yung plan na ginawa ko for you, for me eto na yung pinaka best for you kasi complete package na sya pero pwede pa naman natin itaas or ibaba depende sa gusto mo ha, magbabago nga lang yung mga benefits na indicated hehe.",
+      "Explain ko pala dito sa chat one by one yung benefits ah para if may question ka, replayan mo nalang kada number hehe."
+    ],
+    choices: [{ label: "Next \u2014 benefit 1", next: "benefit_life" }]
+  },
+
+  benefit_life: {
+    stage: "presented",
+    title: "Benefit 1 \u2014 Life insurance",
+    scripts: ["Life insurance, eto yung makukuha ni family ni insured or designated beneficiaries nya if ever si insured mawala na (hindi natin alam kung kailan, pero sure na mangyayari) bali guaranteed yan regardless ng kung anong cause of death except yung mga suicidal, makukuha ni beneficiaries yung benefit na 1M. Pero insured si client hanggang 100 years old. Meaning 10 years ka lang magbabayad pero covered tayo hanggang 100 years old."],
+    choices: [{ label: "Next \u2014 benefit 2", next: "benefit_disability" }]
+  },
+
+  benefit_disability: {
+    stage: "presented",
+    title: "Benefit 2 \u2014 Total Disability",
+    scripts: ["Total Disability - if ever naman na during your investment period nagkaroon ng total disability, waive na yung payment period pero covered ka pa din lifetime."],
+    choices: [{ label: "Next \u2014 benefit 3", next: "benefit_payout" }]
+  },
+
+  benefit_payout: {
+    stage: "presented",
+    title: "Benefit 3 \u2014 Yearly Payout",
+    scripts: ["Yearly Payout \u2014 mag sisimula yung yearly payout mo sa Sun Life after the 6 years of the policy:) Kahit hindi ka pa tapos mag tabi para sa Life Plan mo, unti unti na bumabalik yung binayad mo:) At lifetime yung pension mo dito ha :)"],
+    choices: [
+      { label: "Okay na siya \u2014 walang tanong", next: "forms" },
+      { label: "May questions siya", next: "questions" },
+      { label: "Seen / walang sagot", next: "chase_present" }
+    ]
+  },
+
+  questions: {
+    stage: "presented",
+    title: "Handle the questions",
+    note: "Sagutin lahat ng tanong. Kung kailangan ng adjustment sa budget or benefits, gumawa ng revised proposal at i-send ulit.",
+    scripts: [],
+    choices: [
+      { label: "Sagot na lahat \u2014 proceed", next: "forms" },
+      { label: "Nag-send ng revised proposal", next: "benefit_payout" }
+    ]
+  },
+
+  chase_present: {
+    stage: "presented",
+    title: "Follow up after presenting",
+    note: "Follow up until mag reply. Pwede rin mag-reply sa posts/stories niya sa IG at FB.",
+    scripts: [
+      "Hi {name}? If ever may questions ka pa dun sa Life Plan mo kindly let me know ah para mapush na natin yung application ng plan mo hehe.",
+      "{name}, push na natin plan mooo para mag start na din yung yearly pension mo asap:)",
+      "{name}, noticeeee me hehe."
+    ],
+    choices: [
+      { label: "Nag-reply na", next: "benefit_payout" },
+      { label: "Wala pa \u2014 park muna", next: "home" }
+    ]
+  },
+
+  forms: {
+    stage: "closing",
+    title: "Send the forms",
+    note: "I-send yung form, tapos yung sample selfie-with-ID para alam niya gagawin.",
+    scripts: ["Pasagutan nalang ako neto bro/sis ha:) bali eto yung basic information mo for insurance tapos pasend nalang ng ID and selfie with ID. Thank you! \u263A"],
+    choices: [
+      { label: "Nag-send ng forms at ID", next: "close_bank" },
+      { label: "Seen / hindi pa nag-send", next: "chase_forms" }
+    ]
+  },
+
+  chase_forms: {
+    stage: "closing",
+    title: "Chase the forms",
+    note: "Follow up lang until mag send ng forms and ID.",
+    scripts: [
+      "Hi {name}? Nasagutan mo na ba yung form? Para mapush na natin yung application ng plan mo hehe \u263A",
+      "{name}, push na natin plan mooo para mag start na din yung yearly pension mo asap:)"
+    ],
+    choices: [
+      { label: "Nag-send na", next: "close_bank" },
+      { label: "Wala pa \u2014 park muna", next: "home" }
+    ]
+  },
+
+  close_bank: {
+    stage: "closing",
+    title: "The close \u2014 bank",
+    note: "Two options ulit, hindi yes/no.",
+    scripts: ["{name}:) Start na natin yung life plan mo with Sun Life:) ano bank mo:) BDO or BPI?"],
+    choices: [{ label: "Next \u2014 mode of payment", next: "close_payment" }]
+  },
+
+  close_payment: {
+    stage: "closing",
+    title: "The close \u2014 initial deposit",
+    scripts: ["{name}:) Follow-up ko lang:) Ano prefer mo for initial deposit:) online transfer or via cc?"],
+    choices: [{ label: "Bayad na \u2014 CLOSED! \uD83C\uDF89", next: "done" }]
+  },
+
+  done: {
+    stage: "closing",
+    title: "Closed!",
+    note: "Huwag kalimutan i-log sa Activity Dashboard: Client Closed. Then ask for referrals while the excitement is fresh.",
+    scripts: [],
+    choices: [{ label: "Start a new conversation", next: "home" }]
+  }
+};
+
+function lget(k, fallback) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : fallback; } catch (e) { return fallback; } }
+function lset(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+
+function fill(text, name) {
+  var n = (name || "").trim();
+  return text.replace(/\{name\}/g, n || "friend");
+}
+
+function copyText(text, done) {
+  function fallback() {
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      var ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      done(ok);
+    } catch (e) { done(false); }
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () { done(true); }, fallback);
+  } else { fallback(); }
+}
+
+function App() {
+  var convosState = useState(lget("br-convos", [])); var convos = convosState[0], setConvos = convosState[1];
+  var activeState = useState(null); var activeId = activeState[0], setActiveId = activeState[1];
+  var newNameState = useState(""); var newName = newNameState[0], setNewName = newNameState[1];
+  var toastState = useState(null); var toast = toastState[0], setToast = toastState[1];
+
+  useEffect(function () { lset("br-convos", convos); }, [convos]);
+
+  function flash(msg) {
+    setToast({ msg: msg, id: Date.now() });
+    setTimeout(function () { setToast(null); }, 1600);
+  }
+
+  var active = null;
+  for (var i = 0; i < convos.length; i++) { if (convos[i].id === activeId) active = convos[i]; }
+
+  function startNew() {
+    var nm = newName.trim();
+    if (!nm) { flash("Enter the client's name first"); return; }
+    var convo = { id: String(Date.now()), name: nm, step: "start", updated: Date.now() };
+    setConvos([convo].concat(convos));
+    setActiveId(convo.id);
+    setNewName("");
+  }
+
+  function goTo(stepKey) {
+    if (stepKey === "home") { setActiveId(null); return; }
+    setConvos(convos.map(function (c) {
+      return c.id === activeId ? Object.assign({}, c, { step: stepKey, updated: Date.now() }) : c;
+    }));
+  }
+
+  function removeConvo(id) {
+    setConvos(convos.filter(function (c) { return c.id !== id; }));
+    if (activeId === id) setActiveId(null);
+  }
+
+  var toastEl = toast ? h("div", {
+    key: toast.id,
+    className: "flash fixed left-0 right-0 flex justify-center z-50",
+    style: { bottom: "28px", pointerEvents: "none" }
+  }, h("div", {
+    style: { background: C.ember, color: "#fff" },
+    className: "px-5 py-2.5 rounded-full text-sm font-medium shadow-lg"
+  }, toast.msg)) : null;
+
+  if (!active) {
+    return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
+      h(HomeScreen, {
+        convos: convos, newName: newName, setNewName: setNewName,
+        onStart: startNew, onOpen: setActiveId, onRemove: removeConvo
+      }),
+      toastEl
+    );
+  }
+
+  return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
+    h(StepScreen, { convo: active, onGo: goTo, onHome: function () { setActiveId(null); }, onFlash: flash }),
+    toastEl
+  );
+}
+
+function HomeScreen(props) {
+  var convos = props.convos;
+  return h("div", { className: "max-w-md mx-auto px-5 pt-8 pb-16" },
+    h("div", { className: "mb-7" },
+      h("div", { style: { color: C.ember }, className: "text-[11px] tracking-[0.28em] uppercase font-mono mb-1.5" }, "Battle River Unit"),
+      h("div", { className: "font-display text-3xl leading-tight" }, "Chat Selling Script"),
+      h("div", { style: { color: C.muted }, className: "text-sm mt-1.5" }, "Traditional \u2014 Sell Thru Chat")
+    ),
+
+    h("div", { style: { background: C.surface, borderColor: C.line }, className: "rounded-2xl border p-4 mb-7" },
+      h("div", { style: { color: C.muted }, className: "text-[11px] tracking-widest uppercase font-mono mb-2.5" }, "New conversation"),
+      h("input", {
+        value: props.newName,
+        onChange: function (ev) { props.setNewName(ev.target.value); },
+        onKeyDown: function (ev) { if (ev.key === "Enter") props.onStart(); },
+        placeholder: "Client's first name",
+        style: { background: C.bg, borderColor: C.line, color: C.text },
+        className: "w-full px-4 py-3 rounded-xl border outline-none text-base mb-2.5"
+      }),
+      h("button", {
+        onClick: props.onStart,
+        style: { background: C.ember },
+        className: "w-full py-3.5 rounded-xl text-white font-semibold active:scale-[0.98] transition-transform"
+      }, "Start script")
+    ),
+
+    convos.length > 0 && h("div", null,
+      h("div", { style: { color: C.muted }, className: "text-[11px] tracking-widest uppercase font-mono mb-2.5" },
+        "Active conversations \u00B7 " + convos.length),
+      h("div", { className: "space-y-2" },
+        convos.map(function (c) {
+          var step = STEPS[c.step] || STEPS.start;
+          var stage = STAGES[step.stage];
+          return h("div", {
+            key: c.id,
+            style: { background: C.surface, borderColor: C.line },
+            className: "rounded-2xl border flex items-stretch overflow-hidden"
+          },
+            h("button", {
+              onClick: function () { props.onOpen(c.id); },
+              className: "flex-1 text-left px-4 py-3.5"
+            },
+              h("div", { className: "font-semibold text-[15px]" }, c.name),
+              h("div", { className: "flex items-center gap-2 mt-1" },
+                h("span", { style: { background: stage.color, width: "7px", height: "7px", borderRadius: "50%", display: "inline-block" } }),
+                h("span", { style: { color: C.muted }, className: "text-xs" }, stage.label),
+                h("span", { style: { color: C.line } }, "\u00B7"),
+                h("span", { style: { color: C.muted }, className: "text-xs" }, step.title)
+              )
+            ),
+            h("button", {
+              onClick: function () { props.onRemove(c.id); },
+              style: { color: C.muted, borderColor: C.line },
+              className: "px-4 border-l text-lg active:opacity-60"
+            }, "\u00D7")
+          );
+        })
+      )
+    ),
+
+    convos.length === 0 && h("div", { style: { color: C.muted }, className: "text-sm text-center px-6 leading-relaxed mt-2" },
+      "Start a conversation and the script will remember exactly where you left off with each client.")
+  );
+}
+
+function StepScreen(props) {
+  var convo = props.convo, onGo = props.onGo, onHome = props.onHome, onFlash = props.onFlash;
+  var step = STEPS[convo.step] || STEPS.start;
+  var stage = STAGES[step.stage];
+  var copiedState = useState(null); var copiedIdx = copiedState[0], setCopiedIdx = copiedState[1];
+
+  function doCopy(text, idx) {
+    var out = fill(text, convo.name);
+    copyText(out, function (ok) {
+      if (ok) {
+        setCopiedIdx(idx);
+        setTimeout(function () { setCopiedIdx(null); }, 1800);
+        onFlash("Copied \u2014 paste sa Messenger");
+      } else {
+        onFlash("Couldn't copy \u2014 long-press the text instead");
+      }
+    });
+  }
+
+  return h("div", { className: "max-w-md mx-auto pb-16" },
+    h("div", {
+      style: { background: C.surface, borderColor: C.line },
+      className: "px-5 pt-5 pb-4 border-b sticky top-0 z-10"
+    },
+      h("div", { className: "flex items-center justify-between mb-3" },
+        h("button", { onClick: onHome, style: { color: C.muted }, className: "text-sm font-mono active:opacity-60" }, "\u2039 all chats"),
+        h("div", { className: "flex items-center gap-1.5" },
+          h("span", { style: { background: stage.color, width: "7px", height: "7px", borderRadius: "50%", display: "inline-block" } }),
+          h("span", { style: { color: stage.color }, className: "text-[11px] font-mono uppercase tracking-wider" }, stage.label)
+        )
+      ),
+      h("div", { className: "font-display text-2xl leading-tight" }, convo.name),
+      h("div", { style: { color: C.muted }, className: "text-sm mt-0.5" }, step.title)
+    ),
+
+    h("div", { className: "px-5 pt-5" },
+      step.note && h("div", {
+        style: { background: C.surfaceAlt, borderColor: C.emberDim, color: C.emberSoft },
+        className: "rounded-xl border p-3.5 text-[13px] leading-relaxed mb-4"
+      }, step.note),
+
+      step.scripts.length > 0 && h("div", { className: "space-y-3 mb-6" },
+        step.scripts.map(function (s, idx) {
+          var isCopied = copiedIdx === idx;
+          return h("div", {
+            key: idx,
+            style: { background: C.surface, borderColor: isCopied ? C.ember : C.line },
+            className: "rounded-2xl border overflow-hidden"
+          },
+            step.scripts.length > 1 && h("div", {
+              style: { color: C.muted, borderColor: C.line },
+              className: "px-4 pt-3 pb-2 text-[10px] font-mono uppercase tracking-widest"
+            }, "Option " + (idx + 1)),
+            h("div", { className: "px-4 pt-3 pb-4 text-[15px] leading-relaxed", style: { userSelect: "text" } },
+              fill(s, convo.name)),
+            h("button", {
+              onClick: function () { doCopy(s, idx); },
+              style: { background: isCopied ? C.good : C.ember },
+              className: "w-full py-3.5 text-white font-semibold text-[15px] active:scale-[0.98] transition-transform"
+            }, isCopied ? "\u2713 Copied" : "Copy")
+          );
+        })
+      ),
+
+      h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" },
+        step.scripts.length > 0 ? "Ano sinagot ni client?" : "What's next?"),
+      h("div", { className: "space-y-2" },
+        step.choices.map(function (ch, idx) {
+          return h("button", {
+            key: idx,
+            onClick: function () { onGo(ch.next); },
+            style: { background: C.surfaceAlt, borderColor: C.line },
+            className: "w-full text-left px-4 py-3.5 rounded-xl border text-[15px] active:scale-[0.99] transition-transform flex items-center justify-between gap-3"
+          },
+            h("span", null, ch.label),
+            h("span", { style: { color: C.muted } }, "\u203A")
+          );
+        })
+      ),
+
+      convo.step !== "start" && h("button", {
+        onClick: function () { onGo("start"); },
+        style: { color: C.muted },
+        className: "w-full mt-6 py-3 text-sm font-mono active:opacity-60"
+      }, "restart this conversation")
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(h(App));
+})();
+</script>
+</body>
+</html>
