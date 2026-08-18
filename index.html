@@ -43,16 +43,26 @@ var C = {
 };
 
 // Battle River shield, drawn inline so there's no image file to host.
+// The clip id is per-instance so multiple shields can render at once,
+// and flexShrink:0 stops it collapsing when it sits beside text.
 function Shield(props) {
   var size = props.size || 44;
-  return h("svg", { viewBox: "0 0 100 118", width: size, height: size * 1.18, "aria-label": "Battle River Unit" },
+  var uid = "brShield_" + (props.uid || "main");
+  return h("svg", {
+    viewBox: "0 0 100 118",
+    width: size,
+    height: Math.round(size * 1.18),
+    style: { width: size + "px", height: Math.round(size * 1.18) + "px", flexShrink: 0, display: "block" },
+    role: "img",
+    "aria-label": "Battle River Unit"
+  },
     h("defs", null,
-      h("clipPath", { id: "brShieldInner" },
+      h("clipPath", { id: uid },
         h("path", { d: "M50 11 L85 22 V60 C85 81 68 95 50 103 C32 95 15 81 15 60 V22 Z" })
       )
     ),
     h("path", { d: "M50 3 L93 17 V60 C93 87 73 105 50 114 C27 105 7 87 7 60 V17 Z", fill: "#002040" }),
-    h("g", { clipPath: "url(#brShieldInner)" },
+    h("g", { clipPath: "url(#" + uid + ")" },
       h("rect", { x: "10", y: "8", width: "80", height: "100", fill: "#F0B040" }),
       h("g", { stroke: "#FFE9AF", strokeWidth: "2.6", strokeLinecap: "round" },
         h("line", { x1: "50", y1: "40", x2: "50", y2: "13" }),
@@ -518,8 +528,8 @@ function HomeScreen(props) {
 
   return h("div", { className: "max-w-md mx-auto px-5 pt-8 pb-16" },
     h("div", { className: "flex items-center gap-3.5 mb-7" },
-      h(Shield, { size: 46 }),
-      h("div", null,
+      h(Shield, { size: 46, uid: "home" }),
+      h("div", { className: "min-w-0" },
         h("div", { style: { color: C.gold }, className: "text-[10px] tracking-[0.28em] uppercase font-mono mb-0.5" }, "Battle River Unit"),
         h("div", { className: "font-display text-[26px] leading-tight" }, "Chat Selling Script"),
         h("div", { style: { color: C.muted }, className: "text-[13px] mt-0.5" }, "Traditional \u2014 Sell Thru Chat")
@@ -661,7 +671,7 @@ function StepScreen(props) {
         )
       ),
       h("div", { className: "flex items-center gap-3" },
-        h(Shield, { size: 30 }),
+        h(Shield, { size: 30, uid: "step" }),
         h("div", { className: "min-w-0" },
           h("div", { className: "font-display text-2xl leading-tight truncate" }, convo.name),
           h("div", { className: "flex items-center gap-2 mt-0.5" },
