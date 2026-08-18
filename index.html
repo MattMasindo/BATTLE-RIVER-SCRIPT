@@ -347,6 +347,53 @@ var STEPS = {
   }
 };
 
+// Steps that mean the conversation is over — closed, or a dead lead.
+// These must never sit at the top of the follow-up queue.
+var FINISHED = { done: true, pass_sunlife: true };
+
+function daysSince(ts) { return Math.floor((Date.now() - ts) / 86400000); }
+
+function fmtAgo(ts) {
+  if (!ts) return "";
+  var mins = Math.floor((Date.now() - ts) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return mins + "m ago";
+  var hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + "h ago";
+  var d = Math.floor(hrs / 24);
+  if (d === 1) return "yesterday";
+  if (d < 7) return d + "d ago";
+  var w = Math.floor(d / 7);
+  if (d < 30) return w === 1 ? "1 week ago" : w + " weeks ago";
+  var mo = Math.floor(d / 30);
+  return mo === 1 ? "1 month ago" : mo + " months ago";
+}
+
+// Thresholds follow the script's own cadence: warm market is daily,
+// cold market weekly — so 3 days is a nudge, 7 days is overdue.
+function urgency(convo) {
+  if (FINISHED[convo.step]) return "none";
+  var d = daysSince(convo.updated);
+  if (d >= 7) return "high";
+  if (d >= 3) return "medium";
+  return "low";
+}
+
+function urgencyColor(level) {
+  if (level === "high") return "#E2603F";
+  if (level === "medium") return "#F0B040";
+  return "#8CA5BD";
+}
+
+function sortConvos(list, mode) {
+  return list.slice().sort(function (a, b) {
+    var af = FINISHED[a.step] ? 1 : 0, bf = FINISHED[b.step] ? 1 : 0;
+    if (af !== bf) return af - bf;                    // finished always last
+    if (mode === "stale") return a.updated - b.updated;  // longest untouched first
+    return b.updated - a.updated;                     // most recently touched first
+  });
+}
+
 function lget(k, fallback) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : fallback; } catch (e) { return fallback; } }
 function lset(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
 
@@ -383,9 +430,11 @@ function App() {
   var activeState = useState(null); var activeId = activeState[0], setActiveId = activeState[1];
   var newNameState = useState(""); var newName = newNameState[0], setNewName = newNameState[1];
   var searchState = useState(""); var search = searchState[0], setSearch = searchState[1];
+  var sortState = useState(lget("br-sort", "stale")); var sortMode = sortState[0], setSortMode = sortState[1];
   var toastState = useState(null); var toast = toastState[0], setToast = toastState[1];
 
   useEffect(function () { lset("br-convos", convos); }, [convos]);
+  useEffect(function () { lset("br-sort", sortMode); }, [sortMode]);
 
   function flash(msg) {
     setToast({ msg: msg, id: Date.now() });
@@ -412,6 +461,14 @@ function App() {
     }));
   }
 
+  // Copying a line means it got sent — on the "chase" steps the advisor
+  // stays put, so without this the conversation would look untouched.
+  function touch() {
+    setConvos(convos.map(function (c) {
+      return c.id === activeId ? Object.assign({}, c, { updated: Date.now() }) : c;
+    }));
+  }
+
   function removeConvo(id) {
     setConvos(convos.filter(function (c) { return c.id !== id; }));
     if (activeId === id) setActiveId(null);
@@ -431,6 +488,7 @@ function App() {
       h(HomeScreen, {
         convos: convos, newName: newName, setNewName: setNewName,
         search: search, setSearch: setSearch,
+        sortMode: sortMode, setSortMode: setSortMode,
         onStart: startNew, onOpen: setActiveId, onRemove: removeConvo
       }),
       toastEl
@@ -438,7 +496,7 @@ function App() {
   }
 
   return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
-    h(StepScreen, { convo: active, onGo: goTo, onHome: function () { setActiveId(null); }, onFlash: flash }),
+    h(StepScreen, { convo: active, onGo: goTo, onHome: function () { setActiveId(null); }, onFlash: flash, onTouch: touch }),
     toastEl
   );
 }
@@ -446,9 +504,17 @@ function App() {
 function HomeScreen(props) {
   var convos = props.convos;
   var q = props.search.trim().toLowerCase();
+  var sorted = sortConvos(convos, props.sortMode);
   var shown = q
-    ? convos.filter(function (c) { return c.name.toLowerCase().indexOf(q) !== -1; })
-    : convos;
+    ? sorted.filter(function (c) { return c.name.toLowerCase().indexOf(q) !== -1; })
+    : sorted;
+
+  var needFollowUp = 0, overdue = 0;
+  convos.forEach(function (c) {
+    var u = urgency(c);
+    if (u === "high") { needFollowUp++; overdue++; }
+    else if (u === "medium") { needFollowUp++; }
+  });
 
   return h("div", { className: "max-w-md mx-auto px-5 pt-8 pb-16" },
     h("div", { className: "flex items-center gap-3.5 mb-7" },
@@ -480,7 +546,27 @@ function HomeScreen(props) {
     convos.length > 0 && h("div", null,
       h("div", { className: "flex items-center justify-between mb-2.5" },
         h("div", { style: { color: C.muted }, className: "text-[11px] tracking-widest uppercase font-mono" },
-          "Active conversations \u00B7 " + convos.length)
+          "Active \u00B7 " + convos.length),
+        needFollowUp > 0 && h("div", {
+          style: { color: overdue > 0 ? urgencyColor("high") : C.gold },
+          className: "text-[11px] font-mono font-semibold"
+        }, needFollowUp + " need follow-up")
+      ),
+
+      h("div", { className: "flex gap-1.5 mb-2.5" },
+        [["stale", "Needs follow-up"], ["recent", "Recent"]].map(function (opt) {
+          var on = props.sortMode === opt[0];
+          return h("button", {
+            key: opt[0],
+            onClick: function () { props.setSortMode(opt[0]); },
+            style: {
+              background: on ? C.gold : "transparent",
+              color: on ? "#06223B" : C.muted,
+              borderColor: on ? C.gold : C.line
+            },
+            className: "px-3 py-1.5 rounded-full border text-[12px] font-semibold active:scale-95 transition-transform"
+          }, opt[1]);
+        })
       ),
 
       convos.length >= 5 && h("input", {
@@ -495,21 +581,32 @@ function HomeScreen(props) {
         shown.map(function (c) {
           var step = STEPS[c.step] || STEPS.start;
           var stage = STAGES[step.stage];
+          var level = urgency(c);
+          var finished = !!FINISHED[c.step];
+          var uColor = urgencyColor(level);
           return h("div", {
             key: c.id,
-            style: { background: C.surface, borderColor: C.line },
+            style: {
+              background: C.surface,
+              borderColor: level === "high" ? uColor : C.line,
+              opacity: finished ? 0.55 : 1
+            },
             className: "rounded-2xl border flex items-stretch overflow-hidden"
           },
             h("button", {
               onClick: function () { props.onOpen(c.id); },
-              className: "flex-1 text-left px-4 py-3.5"
+              className: "flex-1 text-left px-4 py-3.5 min-w-0"
             },
-              h("div", { className: "font-semibold text-[15px]" }, c.name),
-              h("div", { className: "flex items-center gap-2 mt-1" },
-                h("span", { style: { background: stage.color, width: "7px", height: "7px", borderRadius: "50%", display: "inline-block" } }),
-                h("span", { style: { color: C.muted }, className: "text-xs" }, stage.label),
-                h("span", { style: { color: C.line } }, "\u00B7"),
-                h("span", { style: { color: C.muted }, className: "text-xs" }, step.title)
+              h("div", { className: "flex items-baseline justify-between gap-3" },
+                h("div", { className: "font-semibold text-[15px] truncate" }, c.name),
+                h("div", {
+                  style: { color: finished ? C.muted : uColor },
+                  className: "text-[11px] font-mono shrink-0" + (level === "high" ? " font-semibold" : "")
+                }, fmtAgo(c.updated))
+              ),
+              h("div", { className: "flex items-center gap-2 mt-1 min-w-0" },
+                h("span", { style: { background: stage.color, width: "7px", height: "7px", borderRadius: "50%", display: "inline-block", flexShrink: 0 } }),
+                h("span", { style: { color: C.muted }, className: "text-xs truncate" }, step.title)
               )
             ),
             h("button", {
@@ -531,10 +628,11 @@ function HomeScreen(props) {
 }
 
 function StepScreen(props) {
-  var convo = props.convo, onGo = props.onGo, onHome = props.onHome, onFlash = props.onFlash;
+  var convo = props.convo, onGo = props.onGo, onHome = props.onHome, onFlash = props.onFlash, onTouch = props.onTouch;
   var step = STEPS[convo.step] || STEPS.start;
   var stage = STAGES[step.stage];
   var copiedState = useState(null); var copiedIdx = copiedState[0], setCopiedIdx = copiedState[1];
+  var level = urgency(convo);
 
   function doCopy(text, idx) {
     var out = fill(text, convo.name);
@@ -542,6 +640,7 @@ function StepScreen(props) {
       if (ok) {
         setCopiedIdx(idx);
         setTimeout(function () { setCopiedIdx(null); }, 1800);
+        if (onTouch) onTouch();
         onFlash("Copied \u2014 paste sa Messenger");
       } else {
         onFlash("Couldn't copy \u2014 long-press the text instead");
@@ -563,11 +662,25 @@ function StepScreen(props) {
       ),
       h("div", { className: "flex items-center gap-3" },
         h(Shield, { size: 30 }),
-        h("div", null,
-          h("div", { className: "font-display text-2xl leading-tight" }, convo.name),
-          h("div", { style: { color: C.muted }, className: "text-sm mt-0.5" }, step.title)
+        h("div", { className: "min-w-0" },
+          h("div", { className: "font-display text-2xl leading-tight truncate" }, convo.name),
+          h("div", { className: "flex items-center gap-2 mt-0.5" },
+            h("span", { style: { color: C.muted }, className: "text-sm" }, step.title),
+            h("span", { style: { color: C.line } }, "\u00B7"),
+            h("span", {
+              style: { color: urgencyColor(level) },
+              className: "text-[11px] font-mono" + (level === "high" ? " font-semibold" : "")
+            }, fmtAgo(convo.updated))
+          )
         )
       )
+    ),
+
+    level === "high" && h("div", { className: "px-5 pt-4" },
+      h("div", {
+        style: { background: "#2A1512", borderColor: urgencyColor("high"), color: "#F5A38C" },
+        className: "rounded-xl border p-3 text-[13px] leading-relaxed"
+      }, "Matagal na \u2014 " + fmtAgo(convo.updated) + " pa yung huling touch. Time to follow up.")
     ),
 
     h("div", { className: "px-5 pt-5" },
