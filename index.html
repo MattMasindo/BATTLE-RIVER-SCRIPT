@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
 <title>Battle River — Chat Selling Script</title>
  
 <!-- Add to Home Screen: installs with the shield icon and opens fullscreen -->
@@ -70,7 +70,7 @@ var CONVERSATIONS_TABLE = "conversation_backups";
 // conversation. Same soft-delete/tombstone pattern as conversations. ---
 var PROSPECTS_TABLE = "prospect_names";
  
-var APP_VERSION = "1.2.0-patch2";
+var APP_VERSION = "1.2.2-add-advisor";
  
 function isSupabaseConfigured() {
   return SUPABASE_URL.indexOf("YOUR-PROJECT") === -1 && SUPABASE_ANON_KEY.indexOf("YOUR-ANON") === -1;
@@ -508,6 +508,29 @@ async function fetchRoster() {
       })
     };
   } catch (e) { return { error: "Couldn't reach the advisor list." }; }
+}
+ 
+// Self-service "I'm new here" roster signup. Requires an anon INSERT policy
+// on ADVISOR_TABLE that does not exist by default (see the migration note)
+// — until that policy is granted, this fails with a normal, non-crashing
+// error message rather than doing anything silently. Only ever sets the
+// columns this app already knows about (name, and active if configured);
+// id and any other column on your real table (e.g. the "code" column) are
+// left to the database's own defaults, since this app has no way to know
+// what value those should hold.
+async function addSelfAsAdvisor(name) {
+  if (!supabaseClient) return { error: "Cloud isn't configured yet." };
+  var nm = name.trim();
+  if (!nm) return { error: "Enter your name first." };
+  try {
+    var row = {};
+    row[ADVISOR_NAME_COLUMN] = nm;
+    if (ADVISOR_ACTIVE_COLUMN) row[ADVISOR_ACTIVE_COLUMN] = true;
+    var res = await supabaseClient.from(ADVISOR_TABLE).insert(row).select(rosterSelectColumns()).single();
+    if (res.error) return { error: res.error.message };
+    var r = res.data;
+    return { data: { id: r[ADVISOR_ID_COLUMN], name: r[ADVISOR_NAME_COLUMN] } };
+  } catch (e) { return { error: "Couldn't add you to the roster." }; }
 }
  
 async function fetchCloudConvos(advisorId) {
@@ -1041,6 +1064,14 @@ function App() {
     flash("Signed in as " + sel.name);
   }
  
+  // Adding a teammate to the roster from an already-signed-in device must
+  // NOT switch this device's own identity — that's the whole point of
+  // this being a separate flow from handleAdvisorSelected.
+  function handleAdvisorAdded(newAdv) {
+    flash("Added " + newAdv.name + " to the roster");
+    setScreen("home");
+  }
+ 
   function startNew() {
     var nm = newName.trim();
     if (!nm) { flash("Enter the client's name first"); return; }
@@ -1255,6 +1286,18 @@ function App() {
     );
   }
  
+  if (screen === "add-advisor") {
+    return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
+      h(IdentityScreen, {
+        mode: "add-advisor",
+        startExpanded: true,
+        onAdded: handleAdvisorAdded,
+        onCancel: function () { setScreen("home"); }
+      }),
+      toastEl
+    );
+  }
+ 
   if (screen === "names") {
     return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
       h(NamesListScreen, {
@@ -1279,9 +1322,11 @@ function App() {
         onOpenSettings: function () { setScreen("settings"); },
         restoreOffer: restoreOffer, onRestore: doRestore, onDismissRestore: dismissRestore,
         prospectCount: prospects.length,
-        onOpenNames: function () { setScreen("names"); }
+        onOpenNames: function () { setScreen("names"); },
+        onQuickAdd: function () { setQuickAddOpen(true); },
+        onAddAdvisor: function () { setScreen("add-advisor"); }
       }),
-      toastEl, fabEl, quickAddSheetEl
+      toastEl, quickAddSheetEl
     );
   }
  
@@ -1343,17 +1388,27 @@ function HomeScreen(props) {
       )
     ),
  
-    h("button", {
-      onClick: props.onOpenNames,
+    h("div", {
       style: { background: C.surfaceAlt, borderColor: C.line },
-      className: "w-full text-left rounded-2xl border p-4 mb-6 flex items-center justify-between gap-3 active:scale-[0.99] transition-transform"
+      className: "rounded-2xl border p-4 mb-6 flex items-center gap-3"
     },
-      h("div", null,
-        h("div", { style: { color: C.muted }, className: "text-[11px] tracking-widest uppercase font-mono mb-1" }, "Names List"),
-        h("div", { className: "text-[15px] font-semibold" },
-          props.prospectCount === 0 ? "No names yet \u2014 tap + to add one" : props.prospectCount + " name" + (props.prospectCount === 1 ? "" : "s") + " not yet promoted")
+      h("button", {
+        onClick: props.onOpenNames,
+        className: "flex-1 text-left flex items-center justify-between gap-3 active:opacity-70 transition-opacity min-w-0"
+      },
+        h("div", { className: "min-w-0" },
+          h("div", { style: { color: C.muted }, className: "text-[11px] tracking-widest uppercase font-mono mb-1" }, "Names List"),
+          h("div", { className: "text-[15px] font-semibold truncate" },
+            props.prospectCount === 0 ? "No names yet" : props.prospectCount + " name" + (props.prospectCount === 1 ? "" : "s") + " not yet promoted")
+        ),
+        h("span", { style: { color: C.muted }, className: "shrink-0" }, "\u203A")
       ),
-      h("span", { style: { color: C.muted } }, "\u203A")
+      h("button", {
+        onClick: props.onQuickAdd,
+        style: { background: C.gold, color: "#06223B" },
+        className: "w-10 h-10 shrink-0 rounded-full flex items-center justify-center text-2xl font-bold active:scale-95 transition-transform",
+        "aria-label": "Quick-add a prospect"
+      }, "+")
     ),
  
     h("div", { style: { background: C.surface, borderColor: C.line }, className: "rounded-2xl border p-4 mb-7" },
@@ -1453,7 +1508,13 @@ function HomeScreen(props) {
     ),
  
     convos.length === 0 && h("div", { style: { color: C.muted }, className: "text-sm text-center px-6 leading-relaxed mt-2" },
-      "Start a conversation and the script will remember exactly where you left off with each client.")
+      "Start a conversation and the script will remember exactly where you left off with each client."),
+ 
+    h("button", {
+      onClick: props.onAddAdvisor,
+      style: { color: C.muted },
+      className: "w-full mt-8 py-3 text-[13px] font-mono active:opacity-60"
+    }, "New advisor joining the team? Add them \u2192")
   );
 }
  
@@ -1632,6 +1693,10 @@ function IdentityScreen(props) {
   var listState = useState(null); var roster = listState[0], setRoster = listState[1]; // null = loading
   var errState = useState(null); var err = errState[0], setErr = errState[1];
   var reloadState = useState(0); var reloadTick = reloadState[0], setReloadTick = reloadState[1];
+  var newAdvisorOpenState = useState(!!props.startExpanded); var newAdvisorOpen = newAdvisorOpenState[0], setNewAdvisorOpen = newAdvisorOpenState[1];
+  var newAdvisorNameState = useState(""); var newAdvisorName = newAdvisorNameState[0], setNewAdvisorName = newAdvisorNameState[1];
+  var newAdvisorBusyState = useState(false); var newAdvisorBusy = newAdvisorBusyState[0], setNewAdvisorBusy = newAdvisorBusyState[1];
+  var newAdvisorErrState = useState(null); var newAdvisorErr = newAdvisorErrState[0], setNewAdvisorErr = newAdvisorErrState[1];
  
   useEffect(function () {
     var cancelled = false;
@@ -1644,18 +1709,33 @@ function IdentityScreen(props) {
     return function () { cancelled = true; };
   }, [reloadTick]);
  
+  function submitNewAdvisor() {
+    if (newAdvisorBusy) return;
+    setNewAdvisorErr(null);
+    setNewAdvisorBusy(true);
+    addSelfAsAdvisor(newAdvisorName).then(function (res) {
+      setNewAdvisorBusy(false);
+      if (res.error) { setNewAdvisorErr(res.error); return; }
+      if (props.onAdded) { props.onAdded(res.data); }
+      else { props.onSelect(res.data); }
+    });
+  }
+ 
   return h("div", { className: "max-w-md mx-auto px-5 pt-10 pb-16" },
     h("div", { className: "flex items-center gap-3.5 mb-8" },
       h(Shield, { size: 44, uid: "identity" }),
       h("div", null,
         h("div", { style: { color: C.gold }, className: "text-[10px] tracking-[0.28em] uppercase font-mono mb-0.5" }, "Battle River Unit"),
         h("div", { className: "font-display text-[22px] leading-tight" },
-          props.mode === "change" ? "Change identity" : "Who's using this device?")
+          props.mode === "change" ? "Change identity" : props.mode === "add-advisor" ? "Add a new advisor" : "Who's using this device?")
       )
     ),
  
     props.mode === "first-run" && h("div", { style: { color: C.muted }, className: "text-[13px] leading-relaxed mb-6" },
       "Pick your name once. This just attributes your conversations and backs them up under the right advisor — there's no password."),
+ 
+    props.mode === "add-advisor" && h("div", { style: { color: C.muted }, className: "text-[13px] leading-relaxed mb-6" },
+      "Add a teammate to the shared roster. This only adds them to the list — it won't change who's signed in on this device."),
  
     props.mode === "change" && h("div", {
       style: { background: C.surfaceAlt, borderColor: C.goldDim, color: C.goldSoft },
@@ -1678,7 +1758,7 @@ function IdentityScreen(props) {
       }, "Try again")
     ),
  
-    roster && roster.length > 0 && h("div", { className: "space-y-2 mb-4" },
+    roster && roster.length > 0 && props.mode !== "add-advisor" && h("div", { className: "space-y-2 mb-4" },
       roster.map(function (r) {
         return h("button", {
           key: r.id,
@@ -1690,6 +1770,46 @@ function IdentityScreen(props) {
           h("span", { style: { color: C.muted } }, "›")
         );
       })
+    ),
+ 
+    !newAdvisorOpen && h("button", {
+      onClick: function () { setNewAdvisorOpen(true); },
+      style: { color: C.gold },
+      className: "w-full py-3 text-sm font-semibold active:opacity-60 mb-2"
+    }, "I'm new here \u2014 add my name"),
+ 
+    newAdvisorOpen && h("div", {
+      style: { background: C.surfaceAlt, borderColor: C.line },
+      className: "rounded-xl border p-4 mb-4"
+    },
+      h("div", { style: { color: C.muted }, className: "text-[12px] leading-relaxed mb-3" },
+        "Adds your name to the shared advisor list so any device can back your conversations up under you."),
+      newAdvisorErr && h("div", { style: { color: "#F5A38C" }, className: "text-[12px] mb-2" }, newAdvisorErr),
+      h("input", {
+        autoFocus: true,
+        value: newAdvisorName,
+        onChange: function (ev) { setNewAdvisorName(ev.target.value); },
+        onKeyDown: function (ev) { if (ev.key === "Enter") submitNewAdvisor(); },
+        placeholder: "Your full name",
+        style: { background: C.bg, borderColor: C.line, color: C.text },
+        className: "w-full px-4 py-3 rounded-xl border outline-none text-base mb-3"
+      }),
+      h("div", { className: "flex gap-2" },
+        h("button", {
+          onClick: submitNewAdvisor,
+          disabled: newAdvisorBusy,
+          style: { background: C.gold, color: "#06223B", opacity: newAdvisorBusy ? 0.6 : 1 },
+          className: "flex-1 py-2.5 rounded-xl text-sm font-bold active:scale-[0.98] transition-transform"
+        }, newAdvisorBusy ? "Adding\u2026" : "Add me"),
+        h("button", {
+          onClick: function () {
+            if (props.mode === "add-advisor" && props.onCancel) { props.onCancel(); return; }
+            setNewAdvisorOpen(false); setNewAdvisorErr(null);
+          },
+          style: { color: C.muted },
+          className: "px-4 py-2.5 text-sm font-mono active:opacity-60"
+        }, "Cancel")
+      )
     ),
  
     props.onCancel && h("button", {
