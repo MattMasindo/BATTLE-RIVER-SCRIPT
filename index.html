@@ -52,23 +52,25 @@ var C = {
 // this file — it ships to every advisor's browser and is readable via
 // "view source".
 // ======================================================================
-var SUPABASE_URL = "https://chymjohbkwopbcdssfoo.supabase.co"; 
+var SUPABASE_URL = "https://chymjohbkwopbcdssfoo.supabase.co";
 var SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNoeW1qb2hia3dvcGJjZHNzZm9vIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY4ODgzMTksImV4cCI6MjEwMjQ2NDMxOX0.wzQsGd-ohaFxz9vknvRUvWXVYnUKGZOLWSumOf2_Da8";
-
  
-// --- Advisor roster: ASSUMED. No existing schema was provided, so confirm
-// these four lines against your real roster table before deploying. If you
-// already have a roster table for the dashboard, point these at it instead
-// of running the "advisors" CREATE TABLE in SUPABASE_MIGRATIONS.sql. ---
+// --- Advisor roster: confirmed against the real table (id, name, code,
+// created_at, active). ---
 var ADVISOR_TABLE = "advisors";
 var ADVISOR_ID_COLUMN = "id";          // stable row id shown to the advisor as their identity
 var ADVISOR_NAME_COLUMN = "name";      // display name shown in the picker
 var ADVISOR_ACTIVE_COLUMN = "active";  // matches the real advisors table — hides inactive roster rows from the picker
  
-// --- Conversation backup table: NEW, created by SUPABASE_MIGRATIONS.sql. ---
+// --- Conversation backup table: created by the Patch 1 migration. ---
 var CONVERSATIONS_TABLE = "conversation_backups";
  
-var APP_VERSION = "1.1.0-patch1";
+// --- Prospect names table: NEW, created by the Patch 2 migration. Raw,
+// unqualified names an advisor jots down before they're worth a full
+// conversation. Same soft-delete/tombstone pattern as conversations. ---
+var PROSPECTS_TABLE = "prospect_names";
+ 
+var APP_VERSION = "1.2.0-patch2";
  
 function isSupabaseConfigured() {
   return SUPABASE_URL.indexOf("YOUR-PROJECT") === -1 && SUPABASE_ANON_KEY.indexOf("YOUR-ANON") === -1;
@@ -681,12 +683,13 @@ function downloadBlob(filename, mime, content) {
   setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
 }
  
-function exportJSON(advisor, convos) {
+function exportJSON(advisor, convos, prospects) {
   var payload = {
     exportedAt: new Date().toISOString(),
     appVersion: APP_VERSION,
     advisor: advisor,
-    conversations: convos
+    conversations: convos,
+    prospects: prospects || []
   };
   downloadBlob(
     "battle-river-script-backup-" + slugify(advisor && advisor.name) + "-" + todayStamp() + ".json",
@@ -719,6 +722,169 @@ function exportCSV(advisor, convos) {
   );
 }
  
+// ======================================================================
+// PATCH 2 — prospect capture / Names List / sync helpers.
+// Mirrors the Patch 1 conversation sync engine function-for-function on
+// purpose: same shape, separate local keys, separate remote table, so a
+// change to one doesn't risk the other. Nothing in this section touches
+// STEPS, STAGES, the 26-step flow, or any Patch 1 conversation code.
+// ======================================================================
+ 
+// Raw, unqualified names live in their own per-advisor bucket — separate
+// from convosKey — so a prospect and a client conversation never collide
+// even if they share a display name.
+function prospectsKey(advisorId) { return "br-prospects-" + advisorId; }
+function prospectSyncMetaKey(advisorId) { return "br-prospect-sync-meta-" + advisorId; }
+ 
+function getProspectSyncMeta(advisorId) { return lget(prospectSyncMetaKey(advisorId), defaultSyncMeta()); }
+function setProspectSyncMeta(advisorId, meta) { lset(prospectSyncMetaKey(advisorId), meta); }
+ 
+async function fetchCloudProspects(advisorId) {
+  if (!supabaseClient) return { data: [] };
+  try {
+    var res = await supabaseClient.from(PROSPECTS_TABLE).select("*").eq("advisor_id", advisorId).is("deleted_at", null);
+    if (res.error) return { data: [], error: res.error.message };
+    return { data: res.data || [] };
+  } catch (e) { return { data: [], error: "Couldn't reach the backup." }; }
+}
+ 
+function toProspectRemoteRow(advisorId, p) {
+  return {
+    advisor_id: advisorId,
+    prospect_id: p.id,
+    name: p.name,
+    created_at: p.created ? new Date(p.created).toISOString() : new Date().toISOString(),
+    updated_at: p.updated ? new Date(p.updated).toISOString() : new Date().toISOString(),
+    deleted_at: null
+  };
+}
+ 
+function prospectTombstoneRow(advisorId, prospectId) {
+  return {
+    advisor_id: advisorId,
+    prospect_id: prospectId,
+    updated_at: new Date().toISOString(),
+    deleted_at: new Date().toISOString()
+  };
+}
+ 
+// created_at is preserved through a tombstone upsert (Supabase only
+// overwrites the columns present in the payload) — that's deliberate:
+// the day a name was first added should stay intact even after it's
+// promoted or removed, since that's the raw signal a habit streak or a
+// manager's coaching view would eventually read from this table.
+function fromProspectRemoteRow(row) {
+  return {
+    id: row.prospect_id,
+    name: row.name || "",
+    created: row.created_at ? Date.parse(row.created_at) : Date.now(),
+    updated: row.updated_at ? Date.parse(row.updated_at) : Date.now()
+  };
+}
+ 
+async function pushProspectUpsert(advisorId, p) {
+  if (!supabaseClient) return false;
+  try {
+    var res = await supabaseClient.from(PROSPECTS_TABLE).upsert(toProspectRemoteRow(advisorId, p), { onConflict: "advisor_id,prospect_id" });
+    return !res.error;
+  } catch (e) { return false; }
+}
+ 
+async function pushProspectTombstone(advisorId, prospectId) {
+  if (!supabaseClient) return false;
+  try {
+    var res = await supabaseClient.from(PROSPECTS_TABLE).upsert(prospectTombstoneRow(advisorId, prospectId), { onConflict: "advisor_id,prospect_id" });
+    return !res.error;
+  } catch (e) { return false; }
+}
+ 
+var prospectSyncTimers = {};
+var prospectSyncInFlight = {};
+ 
+function scheduleProspectSync(advisorId) {
+  clearTimeout(prospectSyncTimers[advisorId]);
+  prospectSyncTimers[advisorId] = setTimeout(function () { runProspectSync(advisorId); }, 900);
+}
+ 
+function markProspectDirty(advisorId, prospectId) {
+  var meta = getProspectSyncMeta(advisorId);
+  if (meta.pendingUpsert.indexOf(prospectId) === -1) meta.pendingUpsert.push(prospectId);
+  setProspectSyncMeta(advisorId, meta);
+  scheduleProspectSync(advisorId);
+}
+ 
+function markProspectDeleted(advisorId, prospectId) {
+  var meta = getProspectSyncMeta(advisorId);
+  meta.pendingUpsert = meta.pendingUpsert.filter(function (id) { return id !== prospectId; });
+  if (meta.pendingDelete.indexOf(prospectId) === -1) meta.pendingDelete.push(prospectId);
+  setProspectSyncMeta(advisorId, meta);
+  scheduleProspectSync(advisorId);
+}
+ 
+async function runProspectSync(advisorId) {
+  if (!advisorId || !supabaseClient) return;
+  if (prospectSyncInFlight[advisorId]) return;
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+ 
+  var meta = getProspectSyncMeta(advisorId);
+  if (meta.pendingUpsert.length === 0 && meta.pendingDelete.length === 0) return;
+ 
+  prospectSyncInFlight[advisorId] = true;
+  try {
+    var prospects = lget(prospectsKey(advisorId), []);
+    var pMap = {};
+    prospects.forEach(function (p) { pMap[p.id] = p; });
+ 
+    var stillPendingUpsert = [];
+    for (var i = 0; i < meta.pendingUpsert.length; i++) {
+      var id = meta.pendingUpsert[i];
+      var p = pMap[id];
+      if (!p) continue; // removed locally before it ever synced
+      var ok = await pushProspectUpsert(advisorId, p);
+      if (!ok) stillPendingUpsert.push(id);
+    }
+ 
+    var stillPendingDelete = [];
+    for (var j = 0; j < meta.pendingDelete.length; j++) {
+      var did = meta.pendingDelete[j];
+      var ok2 = await pushProspectTombstone(advisorId, did);
+      if (!ok2) stillPendingDelete.push(did);
+    }
+ 
+    var fresh = getProspectSyncMeta(advisorId);
+    fresh.pendingUpsert = stillPendingUpsert.concat(
+      fresh.pendingUpsert.filter(function (id) { return meta.pendingUpsert.indexOf(id) === -1; })
+    );
+    fresh.pendingDelete = stillPendingDelete.concat(
+      fresh.pendingDelete.filter(function (id) { return meta.pendingDelete.indexOf(id) === -1; })
+    );
+    fresh.lastSyncedAt = Date.now();
+    fresh.lastSyncStatus = (stillPendingUpsert.length === 0 && stillPendingDelete.length === 0) ? "synced" : "partial";
+    setProspectSyncMeta(advisorId, fresh);
+  } catch (e) {
+    // swallow — background sync failures must never surface as noisy errors
+  } finally {
+    prospectSyncInFlight[advisorId] = false;
+  }
+}
+ 
+function exportProspectsCSV(advisor, prospects) {
+  var rows = [["id", "name", "added", "updated"]];
+  prospects.forEach(function (p) {
+    rows.push([
+      p.id, p.name,
+      p.created ? new Date(p.created).toISOString() : "",
+      p.updated ? new Date(p.updated).toISOString() : ""
+    ]);
+  });
+  var csv = rows.map(function (r) { return r.map(csvEscape).join(","); }).join("\n");
+  downloadBlob(
+    "battle-river-names-list-" + slugify(advisor && advisor.name) + "-" + todayStamp() + ".csv",
+    "text/csv",
+    csv
+  );
+}
+ 
 function App() {
   var advisorState = useState(lget("br-advisor", null)); var advisor = advisorState[0], setAdvisor = advisorState[1];
   var screenState = useState("home"); var screen = screenState[0], setScreen = screenState[1]; // "home" | "settings" | "identity"
@@ -730,6 +896,12 @@ function App() {
   var toastState = useState(null); var toast = toastState[0], setToast = toastState[1];
   var syncMetaState = useState(defaultSyncMeta()); var syncMeta = syncMetaState[0], setSyncMetaState = syncMetaState[1];
   var restoreOfferState = useState(null); var restoreOffer = restoreOfferState[0], setRestoreOffer = restoreOfferState[1];
+  var prospectsState = useState([]); var prospects = prospectsState[0], setProspects = prospectsState[1];
+  var prospectSyncMetaState = useState(defaultSyncMeta()); var prospectSyncMeta = prospectSyncMetaState[0], setProspectSyncMetaState = prospectSyncMetaState[1];
+  var prospectRestoreOfferState = useState(null); var prospectRestoreOffer = prospectRestoreOfferState[0], setProspectRestoreOffer = prospectRestoreOfferState[1];
+  var quickAddState = useState(false); var quickAddOpen = quickAddState[0], setQuickAddOpen = quickAddState[1];
+  var namesSortState = useState(lget("br-names-sort", "stale")); var namesSortMode = namesSortState[0], setNamesSortMode = namesSortState[1];
+  var namesSearchState = useState(""); var namesSearch = namesSearchState[0], setNamesSearch = namesSearchState[1];
  
   function flash(msg) {
     setToast({ msg: msg, id: Date.now() });
@@ -738,6 +910,10 @@ function App() {
  
   function refreshSyncMeta() {
     if (advisor) setSyncMetaState(getSyncMeta(advisor.id));
+  }
+ 
+  function refreshProspectSyncMeta() {
+    if (advisor) setProspectSyncMetaState(getProspectSyncMeta(advisor.id));
   }
  
   // Load this advisor's local conversations whenever the selected advisor
@@ -769,6 +945,7 @@ function App() {
   }, [advisor && advisor.id]);
  
   useEffect(function () { lset("br-sort", sortMode); }, [sortMode]);
+  useEffect(function () { lset("br-names-sort", namesSortMode); }, [namesSortMode]);
  
   // Local save is unconditional and instant on every change — sync is a
   // background concern layered on top, never a precondition for saving.
@@ -776,6 +953,21 @@ function App() {
     if (!advisor) return;
     lset(convosKey(advisor.id), convos);
   }, [convos, advisor && advisor.id]);
+ 
+  // Load this advisor's prospect list whenever the selected advisor
+  // changes. No legacy migration here — prospects didn't exist before
+  // this patch, so there's nothing pre-existing to adopt.
+  useEffect(function () {
+    if (!advisor) { setProspects([]); return; }
+    setProspects(lget(prospectsKey(advisor.id), []));
+    refreshProspectSyncMeta();
+    // eslint-disable-next-line
+  }, [advisor && advisor.id]);
+ 
+  useEffect(function () {
+    if (!advisor) return;
+    lset(prospectsKey(advisor.id), prospects);
+  }, [prospects, advisor && advisor.id]);
  
   // Retry any queued backups on load and whenever the device comes back
   // online, plus a light periodic nudge — all silent, all best-effort.
@@ -785,6 +977,19 @@ function App() {
     function onOnline() { runSync(advisor.id).then(refreshSyncMeta); }
     window.addEventListener("online", onOnline);
     var iv = setInterval(function () { runSync(advisor.id).then(refreshSyncMeta); }, 25000);
+    return function () { window.removeEventListener("online", onOnline); clearInterval(iv); };
+    // eslint-disable-next-line
+  }, [advisor && advisor.id]);
+ 
+  // Same background-sync pattern, running independently for prospects so
+  // a slow/failed conversation sync never blocks a prospect from backing
+  // up (or vice versa).
+  useEffect(function () {
+    if (!advisor) return;
+    runProspectSync(advisor.id).then(refreshProspectSyncMeta);
+    function onOnline() { runProspectSync(advisor.id).then(refreshProspectSyncMeta); }
+    window.addEventListener("online", onOnline);
+    var iv = setInterval(function () { runProspectSync(advisor.id).then(refreshProspectSyncMeta); }, 25000);
     return function () { window.removeEventListener("online", onOnline); clearInterval(iv); };
     // eslint-disable-next-line
   }, [advisor && advisor.id]);
@@ -806,6 +1011,25 @@ function App() {
     return function () { cancelled = true; };
     // eslint-disable-next-line
   }, [advisor && advisor.id, convos.length]);
+ 
+  // Same one-tap restore, independently, for prospects — a fresh phone or
+  // a storage purge shouldn't lose the Names List any more than it should
+  // lose conversations.
+  useEffect(function () {
+    if (!advisor) return;
+    if (prospects.length > 0) return;
+    if (lget("br-names-restore-offered-" + advisor.id, false)) return;
+    if (!supabaseClient) return;
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+    var cancelled = false;
+    fetchCloudProspects(advisor.id).then(function (res) {
+      if (cancelled) return;
+      if (res.data && res.data.length > 0) setProspectRestoreOffer({ rows: res.data });
+      else lset("br-names-restore-offered-" + advisor.id, true);
+    });
+    return function () { cancelled = true; };
+    // eslint-disable-next-line
+  }, [advisor && advisor.id, prospects.length]);
  
   var active = null;
   for (var i = 0; i < convos.length; i++) { if (convos[i].id === activeId) active = convos[i]; }
@@ -860,6 +1084,52 @@ function App() {
     refreshSyncMeta();
   }
  
+  // Deliberately one field. No forced category, no source, no phone
+  // number — anything beyond a name is friction, and friction is exactly
+  // what kills the habit this is meant to build. A soft (non-blocking)
+  // duplicate check just changes the confirmation toast; it never stops
+  // the save.
+  function addProspect(name) {
+    var nm = name.trim();
+    if (!nm) { flash("Enter a name first"); return; }
+    var dupe = prospects.some(function (p) { return p.name.trim().toLowerCase() === nm.toLowerCase(); });
+    var now = Date.now();
+    var prospect = { id: now + "-" + Math.random().toString(36).slice(2, 8), name: nm, created: now, updated: now };
+    setProspects([prospect].concat(prospects));
+    markProspectDirty(advisor.id, prospect.id);
+    refreshProspectSyncMeta();
+    setQuickAddOpen(false);
+    flash(dupe ? "Added \u2014 similar name already on your list" : "Added to your names list");
+  }
+ 
+  // Promoting is just starting a normal conversation at step "start" —
+  // no new step logic, reusing the exact same shape startNew already
+  // creates. The prospect is tombstoned (not hard-deleted) so its
+  // created-date history survives server-side.
+  function promoteProspect(id) {
+    var p = null;
+    for (var i = 0; i < prospects.length; i++) { if (prospects[i].id === id) p = prospects[i]; }
+    if (!p) return;
+    var now = Date.now();
+    var convo = { id: now + "-" + Math.random().toString(36).slice(2, 8), name: p.name, step: "start", created: now, updated: now };
+    setConvos([convo].concat(convos));
+    markDirty(advisor.id, convo.id);
+    refreshSyncMeta();
+ 
+    setProspects(prospects.filter(function (x) { return x.id !== id; }));
+    markProspectDeleted(advisor.id, id);
+    refreshProspectSyncMeta();
+ 
+    setActiveId(convo.id);
+    setScreen("home");
+  }
+ 
+  function removeProspect(id) {
+    setProspects(prospects.filter(function (p) { return p.id !== id; }));
+    markProspectDeleted(advisor.id, id);
+    refreshProspectSyncMeta();
+  }
+ 
   // Idempotent by construction: merges cloud rows into local by id, so
   // tapping Restore twice (or restoring after already restoring) can never
   // create duplicates — it just re-applies the same merge.
@@ -891,10 +1161,44 @@ function App() {
     });
   }
  
+  function doProspectRestore() {
+    if (!prospectRestoreOffer || !advisor) return;
+    var map = {};
+    prospects.forEach(function (p) { map[p.id] = p; });
+    prospectRestoreOffer.rows.forEach(function (r) { var m = fromProspectRemoteRow(r); map[m.id] = m; });
+    var merged = Object.keys(map).map(function (k) { return map[k]; });
+    setProspects(merged);
+    lset("br-names-restore-offered-" + advisor.id, true);
+    var count = prospectRestoreOffer.rows.length;
+    setProspectRestoreOffer(null);
+    flash("Restored " + count + " name" + (count === 1 ? "" : "s"));
+  }
+ 
+  function dismissProspectRestore() {
+    if (advisor) lset("br-names-restore-offered-" + advisor.id, true);
+    setProspectRestoreOffer(null);
+  }
+ 
+  function checkProspectRestoreManually() {
+    if (!advisor) return;
+    if (!supabaseClient) { flash("Cloud isn't configured yet"); return; }
+    fetchCloudProspects(advisor.id).then(function (res) {
+      if (res.error) { flash("Couldn't reach the backup"); return; }
+      if (res.data && res.data.length > 0) setProspectRestoreOffer({ rows: res.data });
+      else flash("No cloud names backup found for " + advisor.name);
+    });
+  }
+ 
   function syncNow() {
     if (!advisor) return;
     if (!supabaseClient) { flash("Cloud isn't configured yet"); return; }
     runSync(advisor.id).then(function () { refreshSyncMeta(); flash("Sync complete"); });
+  }
+ 
+  function syncProspectsNow() {
+    if (!advisor) return;
+    if (!supabaseClient) { flash("Cloud isn't configured yet"); return; }
+    runProspectSync(advisor.id).then(function () { refreshProspectSyncMeta(); flash("Sync complete"); });
   }
  
   var toastEl = toast ? h("div", {
@@ -905,6 +1209,23 @@ function App() {
     style: { background: C.gold, color: "#06223B" },
     className: "px-5 py-2.5 rounded-full text-sm font-semibold shadow-lg"
   }, toast.msg)) : null;
+ 
+  // Floating quick-add: available from any screen (home, names, settings,
+  // even mid-conversation), because the moment an advisor thinks of a
+  // name doesn't wait for them to navigate anywhere first. Deliberately
+  // NOT a screen — it's an overlay, so whatever they were doing is still
+  // exactly where they left it once they close it.
+  var fabEl = h("button", {
+    onClick: function () { setQuickAddOpen(true); },
+    style: { background: C.gold, color: "#06223B" },
+    className: "fixed bottom-6 right-5 z-40 w-14 h-14 rounded-full shadow-lg flex items-center justify-center text-3xl font-bold active:scale-95 transition-transform",
+    "aria-label": "Quick-add a prospect"
+  }, "+");
+ 
+  var quickAddSheetEl = quickAddOpen ? h(QuickAddSheet, {
+    onSave: addProspect,
+    onClose: function () { setQuickAddOpen(false); }
+  }) : null;
  
   if (!advisor || screen === "identity") {
     return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
@@ -922,12 +1243,29 @@ function App() {
     return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
       h(SettingsScreen, {
         advisor: advisor, convos: convos, syncMeta: syncMeta,
+        prospects: prospects, prospectSyncMeta: prospectSyncMeta,
         onBack: function () { setScreen("home"); },
         onChangeIdentity: function () { setScreen("identity"); },
         onSyncNow: syncNow,
-        onCheckRestore: checkRestoreManually
+        onCheckRestore: checkRestoreManually,
+        onSyncProspectsNow: syncProspectsNow,
+        onCheckProspectRestore: checkProspectRestoreManually
       }),
-      toastEl
+      toastEl, fabEl, quickAddSheetEl
+    );
+  }
+ 
+  if (screen === "names") {
+    return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
+      h(NamesListScreen, {
+        prospects: prospects,
+        search: namesSearch, setSearch: setNamesSearch,
+        sortMode: namesSortMode, setSortMode: setNamesSortMode,
+        onBack: function () { setScreen("home"); },
+        onPromote: promoteProspect, onRemove: removeProspect,
+        restoreOffer: prospectRestoreOffer, onRestore: doProspectRestore, onDismissRestore: dismissProspectRestore
+      }),
+      toastEl, fabEl, quickAddSheetEl
     );
   }
  
@@ -939,15 +1277,17 @@ function App() {
         sortMode: sortMode, setSortMode: setSortMode,
         onStart: startNew, onOpen: setActiveId, onRemove: removeConvo,
         onOpenSettings: function () { setScreen("settings"); },
-        restoreOffer: restoreOffer, onRestore: doRestore, onDismissRestore: dismissRestore
+        restoreOffer: restoreOffer, onRestore: doRestore, onDismissRestore: dismissRestore,
+        prospectCount: prospects.length,
+        onOpenNames: function () { setScreen("names"); }
       }),
-      toastEl
+      toastEl, fabEl, quickAddSheetEl
     );
   }
  
   return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
     h(StepScreen, { convo: active, onGo: goTo, onHome: function () { setActiveId(null); }, onFlash: flash, onTouch: touch }),
-    toastEl
+    toastEl, fabEl, quickAddSheetEl
   );
 }
  
@@ -1001,6 +1341,19 @@ function HomeScreen(props) {
           className: "px-4 py-2.5 text-sm font-mono active:opacity-60"
         }, "Not now")
       )
+    ),
+ 
+    h("button", {
+      onClick: props.onOpenNames,
+      style: { background: C.surfaceAlt, borderColor: C.line },
+      className: "w-full text-left rounded-2xl border p-4 mb-6 flex items-center justify-between gap-3 active:scale-[0.99] transition-transform"
+    },
+      h("div", null,
+        h("div", { style: { color: C.muted }, className: "text-[11px] tracking-widest uppercase font-mono mb-1" }, "Names List"),
+        h("div", { className: "text-[15px] font-semibold" },
+          props.prospectCount === 0 ? "No names yet \u2014 tap + to add one" : props.prospectCount + " name" + (props.prospectCount === 1 ? "" : "s") + " not yet promoted")
+      ),
+      h("span", { style: { color: C.muted } }, "\u203A")
     ),
  
     h("div", { style: { background: C.surface, borderColor: C.line }, className: "rounded-2xl border p-4 mb-7" },
@@ -1104,6 +1457,174 @@ function HomeScreen(props) {
   );
 }
  
+// Overlay, not a screen — closing it (Save or Cancel or tapping the
+// backdrop) returns the advisor to exactly whatever they were doing,
+// with zero navigation. One field, on purpose: no category, no source,
+// no phone number. Anything beyond a name is friction.
+function QuickAddSheet(props) {
+  var nameState = useState(""); var name = nameState[0], setName = nameState[1];
+ 
+  function save() { props.onSave(name); }
+ 
+  return h("div", { className: "fixed inset-0 z-50 flex items-end justify-center" },
+    h("div", {
+      onClick: props.onClose,
+      className: "absolute inset-0",
+      style: { background: "rgba(6,26,46,0.7)" }
+    }),
+    h("div", {
+      style: { background: C.surface, borderColor: C.line },
+      className: "relative w-full max-w-md rounded-t-3xl border-t border-x p-5 pb-7"
+    },
+      h("div", { style: { color: C.gold }, className: "text-[10px] tracking-[0.28em] uppercase font-mono mb-3" }, "Quick add"),
+      h("input", {
+        autoFocus: true,
+        value: name,
+        onChange: function (ev) { setName(ev.target.value); },
+        onKeyDown: function (ev) { if (ev.key === "Enter") save(); },
+        placeholder: "Prospect's name",
+        style: { background: C.bg, borderColor: C.line, color: C.text },
+        className: "w-full px-4 py-3 rounded-xl border outline-none text-base mb-3"
+      }),
+      h("div", { className: "flex gap-2" },
+        h("button", {
+          onClick: save,
+          style: { background: C.gold, color: "#06223B" },
+          className: "flex-1 py-3.5 rounded-xl font-bold active:scale-[0.98] transition-transform"
+        }, "Save"),
+        h("button", {
+          onClick: props.onClose,
+          style: { color: C.muted },
+          className: "px-5 py-3.5 text-sm font-mono active:opacity-60"
+        }, "Cancel")
+      )
+    )
+  );
+}
+ 
+// Raw, unqualified names an advisor hasn't started a conversation with
+// yet. Deliberately styled and sorted identically to the conversation
+// follow-up queue (same urgency()/urgencyColor()/sortConvos() functions,
+// same 5+ search threshold) — a prospect going stale is the same signal
+// as a conversation going stale, just one step earlier in the funnel.
+function NamesListScreen(props) {
+  var prospects = props.prospects;
+  var q = props.search.trim().toLowerCase();
+  var sorted = sortConvos(prospects, props.sortMode);
+  var shown = q
+    ? sorted.filter(function (p) { return p.name.toLowerCase().indexOf(q) !== -1; })
+    : sorted;
+ 
+  var needFollowUp = 0, overdue = 0;
+  prospects.forEach(function (p) {
+    var u = urgency(p);
+    if (u === "high") { needFollowUp++; overdue++; }
+    else if (u === "medium") { needFollowUp++; }
+  });
+ 
+  return h("div", { className: "max-w-md mx-auto pb-16" },
+    h("div", {
+      style: { background: C.surface, borderColor: C.line },
+      className: "px-5 pt-5 pb-4 border-b sticky top-0 z-10"
+    },
+      h("button", { onClick: props.onBack, style: { color: C.muted }, className: "text-sm font-mono active:opacity-60 mb-3" }, "\u2039 all chats"),
+      h("div", { className: "flex items-center justify-between" },
+        h("div", { className: "font-display text-2xl" }, "Names List"),
+        needFollowUp > 0 && h("div", {
+          style: { color: overdue > 0 ? urgencyColor("high") : C.gold },
+          className: "text-[11px] font-mono font-semibold"
+        }, needFollowUp + " need follow-up")
+      )
+    ),
+ 
+    h("div", { className: "px-5 pt-5" },
+ 
+      props.restoreOffer && h("div", {
+        style: { background: C.surfaceAlt, borderColor: C.gold },
+        className: "rounded-2xl border p-4 mb-6"
+      },
+        h("div", { className: "text-[14px] leading-relaxed mb-3" },
+          "We found " + props.restoreOffer.rows.length + " saved name" + (props.restoreOffer.rows.length === 1 ? "" : "s") +
+          " backed up to the cloud. Restore " + (props.restoreOffer.rows.length === 1 ? "it" : "them") + " to this device?"),
+        h("div", { className: "flex gap-2" },
+          h("button", {
+            onClick: props.onRestore,
+            style: { background: C.gold, color: "#06223B" },
+            className: "flex-1 py-2.5 rounded-xl text-sm font-bold active:scale-[0.98] transition-transform"
+          }, "Restore"),
+          h("button", {
+            onClick: props.onDismissRestore,
+            style: { color: C.muted },
+            className: "px-4 py-2.5 text-sm font-mono active:opacity-60"
+          }, "Not now")
+        )
+      ),
+ 
+      prospects.length >= 5 && h("div", { className: "flex gap-1.5 mb-2.5" },
+        [["stale", "Needs follow-up"], ["recent", "Recent"]].map(function (opt) {
+          var on = props.sortMode === opt[0];
+          return h("button", {
+            key: opt[0],
+            onClick: function () { props.setSortMode(opt[0]); },
+            style: {
+              background: on ? C.gold : "transparent",
+              color: on ? "#06223B" : C.muted,
+              borderColor: on ? C.gold : C.line
+            },
+            className: "px-3 py-1.5 rounded-full border text-[12px] font-semibold active:scale-95 transition-transform"
+          }, opt[1]);
+        })
+      ),
+ 
+      prospects.length >= 5 && h("input", {
+        value: props.search,
+        onChange: function (ev) { props.setSearch(ev.target.value); },
+        placeholder: "Search by name\u2026",
+        style: { background: C.surface, borderColor: C.line, color: C.text },
+        className: "w-full px-4 py-2.5 rounded-xl border outline-none text-[15px] mb-2.5"
+      }),
+ 
+      h("div", { className: "space-y-2" },
+        shown.map(function (p) {
+          var level = urgency(p);
+          var uColor = urgencyColor(level);
+          return h("div", {
+            key: p.id,
+            style: { background: C.surface, borderColor: level === "high" ? uColor : C.line },
+            className: "rounded-2xl border flex items-stretch overflow-hidden"
+          },
+            h("div", { className: "flex-1 px-4 py-3.5 min-w-0" },
+              h("div", { className: "flex items-baseline justify-between gap-3" },
+                h("div", { className: "font-semibold text-[15px] truncate" }, p.name),
+                h("div", {
+                  style: { color: uColor },
+                  className: "text-[11px] font-mono shrink-0" + (level === "high" ? " font-semibold" : "")
+                }, fmtAgo(p.updated))
+              ),
+              h("button", {
+                onClick: function () { props.onPromote(p.id); },
+                style: { color: C.gold },
+                className: "text-[13px] font-semibold mt-1.5 active:opacity-60"
+              }, "Promote \u2192 start conversation")
+            ),
+            h("button", {
+              onClick: function () { props.onRemove(p.id); },
+              style: { color: C.muted, borderColor: C.line },
+              className: "px-4 border-l text-lg active:opacity-60"
+            }, "\u00D7")
+          );
+        })
+      ),
+ 
+      q && shown.length === 0 && h("div", { style: { color: C.muted }, className: "text-sm text-center py-6" },
+        "No match for \u201C" + props.search.trim() + "\u201D"),
+ 
+      prospects.length === 0 && h("div", { style: { color: C.muted }, className: "text-sm text-center px-2 leading-relaxed mt-6" },
+        "Tap the + button anytime you think of someone \u2014 no details needed, just the name.")
+    )
+  );
+}
+ 
 // One-time (or advisor-initiated) identity picker. Mode "first-run" blocks
 // the rest of the app until a name is picked and offers no cancel. Mode
 // "change" is reached voluntarily from Settings and can be backed out of.
@@ -1203,7 +1724,7 @@ function SettingsScreen(props) {
         }, "Change identity")
       ),
  
-      h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" }, "Cloud backup"),
+      h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" }, "Cloud backup \u2014 conversations"),
       h("div", { style: { background: C.surface, borderColor: C.line }, className: "rounded-2xl border p-4 mb-6" },
         h("div", { className: "text-[13px] mb-3" }, syncStatusText(meta)),
         h("div", { className: "flex gap-2" },
@@ -1220,21 +1741,43 @@ function SettingsScreen(props) {
         )
       ),
  
+      h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" }, "Cloud backup \u2014 names list"),
+      h("div", { style: { background: C.surface, borderColor: C.line }, className: "rounded-2xl border p-4 mb-6" },
+        h("div", { className: "text-[13px] mb-3" }, syncStatusText(props.prospectSyncMeta)),
+        h("div", { className: "flex gap-2" },
+          h("button", {
+            onClick: props.onSyncProspectsNow,
+            style: { background: C.gold, color: "#06223B" },
+            className: "flex-1 py-2.5 rounded-xl text-sm font-bold active:scale-[0.98] transition-transform"
+          }, "Sync now"),
+          h("button", {
+            onClick: props.onCheckProspectRestore,
+            style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
+            className: "flex-1 py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
+          }, "Restore from cloud")
+        )
+      ),
+ 
       h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" }, "Export"),
       h("div", { style: { background: C.surface, borderColor: C.line }, className: "rounded-2xl border p-4 mb-6" },
         h("div", { style: { color: C.muted }, className: "text-[12px] mb-3" }, "A personal copy of everything on this device — not a substitute for the cloud backup above."),
-        h("div", { className: "flex gap-2" },
+        h("div", { className: "flex gap-2 mb-2" },
           h("button", {
-            onClick: function () { exportJSON(advisor, convos); },
+            onClick: function () { exportJSON(advisor, convos, props.prospects); },
             style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
             className: "flex-1 py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
-          }, "Export JSON"),
+          }, "Export JSON (everything)"),
           h("button", {
             onClick: function () { exportCSV(advisor, convos); },
             style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
             className: "flex-1 py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
-          }, "Export CSV")
-        )
+          }, "Export conversations CSV")
+        ),
+        h("button", {
+          onClick: function () { exportProspectsCSV(advisor, props.prospects); },
+          style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
+          className: "w-full py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
+        }, "Export names list CSV")
       ),
  
       h("div", { style: { color: C.muted }, className: "text-[11px] leading-relaxed" },
@@ -1361,3 +1904,74 @@ ReactDOM.createRoot(document.getElementById("root")).render(h(App));
 </script>
 </body>
 </html>
+ 
+COPY EVERYTHING BELOW THIS LINE INTO the Supabase SQL Editor
+-- ============================================================================
+-- Battle River — Script Tool Patch 2 Supabase migration
+-- ============================================================================
+-- Run this in the Supabase SQL editor against your existing project
+-- (chymjohbkwopbcdssfoo) — same project as Patch 1's conversation_backups.
+--
+-- This only adds ONE new table (prospect_names). It doesn't touch advisors
+-- or conversation_backups at all.
+--
+-- Same security model as conversation_backups (see Patch 1's migration for
+-- the full note): the anon key has no real per-advisor restriction, so
+-- these policies are permissive-but-scoped hygiene, not access control.
+-- Don't store anything in this table beyond a first name.
+-- ============================================================================
+ 
+create table if not exists public.prospect_names (
+  id            bigint generated always as identity primary key,
+  advisor_id    uuid not null references public.advisors (id),
+ 
+  prospect_id   text not null,          -- stable per-prospect id from the client
+  name          text,                   -- nullable: a tombstone row may not carry it
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now(),
+  deleted_at    timestamptz,            -- soft-delete marker; set on remove OR on promotion to a conversation
+ 
+  constraint prospect_names_advisor_prospect_unique unique (advisor_id, prospect_id)
+);
+ 
+comment on table public.prospect_names is
+  'Script Tool Patch 2 raw prospect capture, one row per (advisor_id, prospect_id). deleted_at is set both when a name is removed and when it is promoted into a conversation — either way it should no longer show in the active Names List, but created_at survives so the day it was first added is never lost (useful later for a habit-streak or coaching view).';
+ 
+create index if not exists prospect_names_advisor_active_idx
+  on public.prospect_names (advisor_id)
+  where deleted_at is null;
+ 
+alter table public.prospect_names enable row level security;
+ 
+drop policy if exists prospect_names_anon_select on public.prospect_names;
+create policy prospect_names_anon_select
+  on public.prospect_names
+  for select
+  to anon
+  using (true);
+ 
+drop policy if exists prospect_names_anon_insert on public.prospect_names;
+create policy prospect_names_anon_insert
+  on public.prospect_names
+  for insert
+  to anon
+  with check (true);
+ 
+drop policy if exists prospect_names_anon_update on public.prospect_names;
+create policy prospect_names_anon_update
+  on public.prospect_names
+  for update
+  to anon
+  using (true)
+  with check (true);
+ 
+-- Deliberately no anon delete policy — same reasoning as conversation_backups.
+ 
+ 
+-- ============================================================================
+-- Verification queries (optional, safe to run any time)
+-- ============================================================================
+-- select advisor_id, count(*) from public.prospect_names where deleted_at is null group by advisor_id;
+-- select advisor_id, count(distinct created_at::date) as days_active
+--   from public.prospect_names group by advisor_id; -- a rough preview of the habit signal the Dashboard will eventually read
+ 
