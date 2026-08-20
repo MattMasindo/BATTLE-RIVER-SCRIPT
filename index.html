@@ -19,6 +19,8 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<!-- Patch 1: Supabase browser client (public/anon key only — see CONFIG block below) -->
+<script src="https://unpkg.com/@supabase/supabase-js@2"></script>
 <style>
   body { font-family: 'Inter', sans-serif; background: #061A2E; -webkit-tap-highlight-color: transparent; }
   .font-display { font-family: 'Space Grotesk', sans-serif; }
@@ -41,6 +43,44 @@ var C = {
   gold: "#F0B040", goldSoft: "#F5CE85", goldDim: "#6B4A14",
   text: "#FFF0E0", muted: "#8CA5BD", line: "#1A3A58", good: "#4FB477"
 };
+
+// ======================================================================
+// PATCH 1 CONFIGURATION — edit this block only. Nothing below this block
+// hardcodes a table or column name; everything reads these constants.
+//
+// Uses the Supabase PUBLIC/ANON key only. Never put a service-role key in
+// this file — it ships to every advisor's browser and is readable via
+// "view source".
+// ======================================================================
+var SUPABASE_URL = "https://YOUR-PROJECT.supabase.co";
+var SUPABASE_ANON_KEY = "YOUR-ANON-PUBLIC-KEY";
+
+// --- Advisor roster: ASSUMED. No existing schema was provided, so confirm
+// these four lines against your real roster table before deploying. If you
+// already have a roster table for the dashboard, point these at it instead
+// of running the "advisors" CREATE TABLE in SUPABASE_MIGRATIONS.sql. ---
+var ADVISOR_TABLE = "advisors";
+var ADVISOR_ID_COLUMN = "id";          // stable row id shown to the advisor as their identity
+var ADVISOR_NAME_COLUMN = "name";      // display name shown in the picker
+var ADVISOR_ACTIVE_COLUMN = null;      // e.g. "is_active" to hide inactive advisors, or null to skip filtering
+
+// --- Conversation backup table: NEW, created by SUPABASE_MIGRATIONS.sql. ---
+var CONVERSATIONS_TABLE = "conversation_backups";
+
+var APP_VERSION = "1.1.0-patch1";
+
+function isSupabaseConfigured() {
+  return SUPABASE_URL.indexOf("YOUR-PROJECT") === -1 && SUPABASE_ANON_KEY.indexOf("YOUR-ANON") === -1;
+}
+
+// Never throws — an unconfigured or unreachable Supabase must not break the
+// script itself. Every caller below treats a null client as "cloud off".
+var supabaseClient = null;
+try {
+  if (isSupabaseConfigured() && window.supabase && window.supabase.createClient) {
+    supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  }
+} catch (e) { supabaseClient = null; }
 
 // Battle River shield, drawn inline so there's no image file to host.
 // The clip id is per-instance so multiple shields can render at once,
@@ -435,53 +475,425 @@ function copyText(text, done) {
   } else { fallback(); }
 }
 
+// ======================================================================
+// PATCH 1 — cloud backup / restore / export helpers.
+// Nothing in this section touches STEPS, STAGES, or the 26-step flow.
+// ======================================================================
+
+// Per-advisor local storage bucket. Keeping conversations keyed by advisor
+// id (rather than the single old "br-convos" key) is what stops a device
+// changing hands from mixing one advisor's data into another's.
+function convosKey(advisorId) { return "br-convos-" + advisorId; }
+function syncMetaKey(advisorId) { return "br-sync-meta-" + advisorId; }
+
+function rosterSelectColumns() {
+  var cols = [ADVISOR_ID_COLUMN, ADVISOR_NAME_COLUMN];
+  if (ADVISOR_ACTIVE_COLUMN) cols.push(ADVISOR_ACTIVE_COLUMN);
+  return cols.join(",");
+}
+
+async function fetchRoster() {
+  if (!supabaseClient) return { error: "Cloud isn't configured yet." };
+  try {
+    var q = supabaseClient.from(ADVISOR_TABLE).select(rosterSelectColumns()).order(ADVISOR_NAME_COLUMN, { ascending: true });
+    if (ADVISOR_ACTIVE_COLUMN) q = q.eq(ADVISOR_ACTIVE_COLUMN, true);
+    var res = await q;
+    if (res.error) return { error: res.error.message };
+    return {
+      data: (res.data || []).map(function (row) {
+        return { id: row[ADVISOR_ID_COLUMN], name: row[ADVISOR_NAME_COLUMN] };
+      })
+    };
+  } catch (e) { return { error: "Couldn't reach the advisor list." }; }
+}
+
+async function fetchCloudConvos(advisorId) {
+  if (!supabaseClient) return { data: [] };
+  try {
+    var res = await supabaseClient.from(CONVERSATIONS_TABLE).select("*").eq("advisor_id", advisorId).is("deleted_at", null);
+    if (res.error) return { data: [], error: res.error.message };
+    return { data: res.data || [] };
+  } catch (e) { return { data: [], error: "Couldn't reach the backup." }; }
+}
+
+function toRemoteRow(advisorId, c) {
+  return {
+    advisor_id: advisorId,
+    convo_id: c.id,
+    client_name: c.name,
+    current_step: c.step,
+    created_at: c.created ? new Date(c.created).toISOString() : new Date().toISOString(),
+    updated_at: c.updated ? new Date(c.updated).toISOString() : new Date().toISOString(),
+    deleted_at: null
+  };
+}
+
+function tombstoneRow(advisorId, convoId) {
+  return {
+    advisor_id: advisorId,
+    convo_id: convoId,
+    updated_at: new Date().toISOString(),
+    deleted_at: new Date().toISOString()
+  };
+}
+
+// Reconstructs a local conversation object from a cloud row. Falls back to
+// "start" if a step key doesn't exist in this build's STEPS (e.g. restoring
+// onto an older/newer script version).
+function fromRemoteRow(row) {
+  var step = STEPS[row.current_step] ? row.current_step : "start";
+  return {
+    id: row.convo_id,
+    name: row.client_name || "",
+    step: step,
+    created: row.created_at ? Date.parse(row.created_at) : Date.now(),
+    updated: row.updated_at ? Date.parse(row.updated_at) : Date.now()
+  };
+}
+
+async function pushUpsert(advisorId, convo) {
+  if (!supabaseClient) return false;
+  try {
+    var res = await supabaseClient.from(CONVERSATIONS_TABLE).upsert(toRemoteRow(advisorId, convo), { onConflict: "advisor_id,convo_id" });
+    return !res.error;
+  } catch (e) { return false; }
+}
+
+async function pushTombstone(advisorId, convoId) {
+  if (!supabaseClient) return false;
+  try {
+    var res = await supabaseClient.from(CONVERSATIONS_TABLE).upsert(tombstoneRow(advisorId, convoId), { onConflict: "advisor_id,convo_id" });
+    return !res.error;
+  } catch (e) { return false; }
+}
+
+function defaultSyncMeta() { return { pendingUpsert: [], pendingDelete: [], lastSyncedAt: null, lastSyncStatus: "idle" }; }
+function getSyncMeta(advisorId) { return lget(syncMetaKey(advisorId), defaultSyncMeta()); }
+function setSyncMeta(advisorId, meta) { lset(syncMetaKey(advisorId), meta); }
+
+var syncTimers = {};
+var syncInFlight = {};
+
+function scheduleSync(advisorId) {
+  clearTimeout(syncTimers[advisorId]);
+  syncTimers[advisorId] = setTimeout(function () { runSync(advisorId); }, 900);
+}
+
+// Marks a conversation as needing a background push. Called synchronously
+// right after every local create/step-change/touch, so "pending" counts in
+// Settings are accurate even before the debounced push fires.
+function markDirty(advisorId, convoId) {
+  var meta = getSyncMeta(advisorId);
+  if (meta.pendingUpsert.indexOf(convoId) === -1) meta.pendingUpsert.push(convoId);
+  setSyncMeta(advisorId, meta);
+  scheduleSync(advisorId);
+}
+
+// Marks a conversation as needing a remote tombstone. Deleting locally is
+// still instant and unconditional — this only queues the background half.
+function markDeleted(advisorId, convoId) {
+  var meta = getSyncMeta(advisorId);
+  meta.pendingUpsert = meta.pendingUpsert.filter(function (id) { return id !== convoId; });
+  if (meta.pendingDelete.indexOf(convoId) === -1) meta.pendingDelete.push(convoId);
+  setSyncMeta(advisorId, meta);
+  scheduleSync(advisorId);
+}
+
+// Never throws, never blocks the UI, never shows a popup. Safe to call as
+// often as we like — it no-ops immediately when offline, unconfigured, or
+// already running, and only touches localStorage + network.
+async function runSync(advisorId) {
+  if (!advisorId || !supabaseClient) return;
+  if (syncInFlight[advisorId]) return;
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+
+  var meta = getSyncMeta(advisorId);
+  if (meta.pendingUpsert.length === 0 && meta.pendingDelete.length === 0) return;
+
+  syncInFlight[advisorId] = true;
+  try {
+    var convos = lget(convosKey(advisorId), []);
+    var convoMap = {};
+    convos.forEach(function (c) { convoMap[c.id] = c; });
+
+    var stillPendingUpsert = [];
+    for (var i = 0; i < meta.pendingUpsert.length; i++) {
+      var id = meta.pendingUpsert[i];
+      var c = convoMap[id];
+      if (!c) continue; // deleted locally before it ever synced — nothing left to push
+      var ok = await pushUpsert(advisorId, c);
+      if (!ok) stillPendingUpsert.push(id);
+    }
+
+    var stillPendingDelete = [];
+    for (var j = 0; j < meta.pendingDelete.length; j++) {
+      var did = meta.pendingDelete[j];
+      var ok2 = await pushTombstone(advisorId, did);
+      if (!ok2) stillPendingDelete.push(did);
+    }
+
+    var fresh = getSyncMeta(advisorId); // re-read in case something queued more work mid-flight
+    fresh.pendingUpsert = stillPendingUpsert.concat(
+      fresh.pendingUpsert.filter(function (id) { return meta.pendingUpsert.indexOf(id) === -1; })
+    );
+    fresh.pendingDelete = stillPendingDelete.concat(
+      fresh.pendingDelete.filter(function (id) { return meta.pendingDelete.indexOf(id) === -1; })
+    );
+    fresh.lastSyncedAt = Date.now();
+    fresh.lastSyncStatus = (stillPendingUpsert.length === 0 && stillPendingDelete.length === 0) ? "synced" : "partial";
+    setSyncMeta(advisorId, fresh);
+  } catch (e) {
+    // swallow — background sync failures must never surface as noisy errors
+  } finally {
+    syncInFlight[advisorId] = false;
+  }
+}
+
+function syncStatusText(meta) {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return "Offline — will back up when back online";
+  var pending = (meta.pendingUpsert || []).length + (meta.pendingDelete || []).length;
+  if (pending > 0) return pending + " change" + (pending === 1 ? "" : "s") + " waiting to sync";
+  if (meta.lastSyncedAt) return "Backed up " + fmtAgo(meta.lastSyncedAt);
+  return "Not backed up yet";
+}
+
+function slugify(s) {
+  var out = (s || "advisor").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+  return out || "advisor";
+}
+
+function todayStamp() {
+  var d = new Date();
+  function p(n) { return n < 10 ? "0" + n : "" + n; }
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+
+function downloadBlob(filename, mime, content) {
+  var blob = new Blob([content], { type: mime });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+}
+
+function exportJSON(advisor, convos) {
+  var payload = {
+    exportedAt: new Date().toISOString(),
+    appVersion: APP_VERSION,
+    advisor: advisor,
+    conversations: convos
+  };
+  downloadBlob(
+    "battle-river-script-backup-" + slugify(advisor && advisor.name) + "-" + todayStamp() + ".json",
+    "application/json",
+    JSON.stringify(payload, null, 2)
+  );
+}
+
+function csvEscape(v) {
+  var s = String(v == null ? "" : v);
+  if (/[",\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function exportCSV(advisor, convos) {
+  var rows = [["id", "client_name", "step_key", "step_title", "stage", "created", "updated"]];
+  convos.forEach(function (c) {
+    var step = STEPS[c.step] || STEPS.start;
+    rows.push([
+      c.id, c.name, c.step, step.title, step.stage,
+      c.created ? new Date(c.created).toISOString() : "",
+      c.updated ? new Date(c.updated).toISOString() : ""
+    ]);
+  });
+  var csv = rows.map(function (r) { return r.map(csvEscape).join(","); }).join("\n");
+  downloadBlob(
+    "battle-river-script-backup-" + slugify(advisor && advisor.name) + "-" + todayStamp() + ".csv",
+    "text/csv",
+    csv
+  );
+}
+
 function App() {
-  var convosState = useState(lget("br-convos", [])); var convos = convosState[0], setConvos = convosState[1];
+  var advisorState = useState(lget("br-advisor", null)); var advisor = advisorState[0], setAdvisor = advisorState[1];
+  var screenState = useState("home"); var screen = screenState[0], setScreen = screenState[1]; // "home" | "settings" | "identity"
+  var convosState = useState([]); var convos = convosState[0], setConvos = convosState[1];
   var activeState = useState(null); var activeId = activeState[0], setActiveId = activeState[1];
   var newNameState = useState(""); var newName = newNameState[0], setNewName = newNameState[1];
   var searchState = useState(""); var search = searchState[0], setSearch = searchState[1];
   var sortState = useState(lget("br-sort", "stale")); var sortMode = sortState[0], setSortMode = sortState[1];
   var toastState = useState(null); var toast = toastState[0], setToast = toastState[1];
-
-  useEffect(function () { lset("br-convos", convos); }, [convos]);
-  useEffect(function () { lset("br-sort", sortMode); }, [sortMode]);
+  var syncMetaState = useState(defaultSyncMeta()); var syncMeta = syncMetaState[0], setSyncMetaState = syncMetaState[1];
+  var restoreOfferState = useState(null); var restoreOffer = restoreOfferState[0], setRestoreOffer = restoreOfferState[1];
 
   function flash(msg) {
     setToast({ msg: msg, id: Date.now() });
     setTimeout(function () { setToast(null); }, 1600);
   }
 
+  function refreshSyncMeta() {
+    if (advisor) setSyncMetaState(getSyncMeta(advisor.id));
+  }
+
+  // Load this advisor's local conversations whenever the selected advisor
+  // changes. The very first time a bucket doesn't exist yet for an advisor,
+  // adopt any pre-Patch-1 conversations already on this device (once, ever)
+  // rather than losing them — but never again after that, so a second
+  // advisor picking their name on the same device starts clean.
+  useEffect(function () {
+    if (!advisor) { setConvos([]); return; }
+    var key = convosKey(advisor.id);
+    var raw = null;
+    try { raw = localStorage.getItem(key); } catch (e) {}
+    var loaded;
+    if (raw === null) {
+      var migrated = null;
+      if (!lget("br-legacy-migrated", false)) {
+        var legacy = lget("br-convos", null);
+        if (legacy && legacy.length) { migrated = legacy; lset("br-legacy-migrated", true); flash("Linked existing conversations on this device"); }
+      }
+      loaded = migrated || [];
+      lset(key, loaded);
+    } else {
+      try { loaded = JSON.parse(raw) || []; } catch (e2) { loaded = []; }
+    }
+    setConvos(loaded);
+    setActiveId(null);
+    refreshSyncMeta();
+    // eslint-disable-next-line
+  }, [advisor && advisor.id]);
+
+  useEffect(function () { lset("br-sort", sortMode); }, [sortMode]);
+
+  // Local save is unconditional and instant on every change — sync is a
+  // background concern layered on top, never a precondition for saving.
+  useEffect(function () {
+    if (!advisor) return;
+    lset(convosKey(advisor.id), convos);
+  }, [convos, advisor && advisor.id]);
+
+  // Retry any queued backups on load and whenever the device comes back
+  // online, plus a light periodic nudge — all silent, all best-effort.
+  useEffect(function () {
+    if (!advisor) return;
+    runSync(advisor.id).then(refreshSyncMeta);
+    function onOnline() { runSync(advisor.id).then(refreshSyncMeta); }
+    window.addEventListener("online", onOnline);
+    var iv = setInterval(function () { runSync(advisor.id).then(refreshSyncMeta); }, 25000);
+    return function () { window.removeEventListener("online", onOnline); clearInterval(iv); };
+    // eslint-disable-next-line
+  }, [advisor && advisor.id]);
+
+  // Offer a one-tap restore exactly once per advisor, only when this
+  // device's local storage is genuinely empty for them.
+  useEffect(function () {
+    if (!advisor) return;
+    if (convos.length > 0) return;
+    if (lget("br-restore-offered-" + advisor.id, false)) return;
+    if (!supabaseClient) return;
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+    var cancelled = false;
+    fetchCloudConvos(advisor.id).then(function (res) {
+      if (cancelled) return;
+      if (res.data && res.data.length > 0) setRestoreOffer({ rows: res.data });
+      else lset("br-restore-offered-" + advisor.id, true);
+    });
+    return function () { cancelled = true; };
+    // eslint-disable-next-line
+  }, [advisor && advisor.id, convos.length]);
+
   var active = null;
   for (var i = 0; i < convos.length; i++) { if (convos[i].id === activeId) active = convos[i]; }
+
+  function handleAdvisorSelected(sel) {
+    lset("br-advisor", sel);
+    setAdvisor(sel);
+    setScreen("home");
+    flash("Signed in as " + sel.name);
+  }
 
   function startNew() {
     var nm = newName.trim();
     if (!nm) { flash("Enter the client's name first"); return; }
-    var convo = { id: String(Date.now()), name: nm, step: "start", updated: Date.now() };
+    var now = Date.now();
+    var convo = { id: now + "-" + Math.random().toString(36).slice(2, 8), name: nm, step: "start", created: now, updated: now };
     setConvos([convo].concat(convos));
     setActiveId(convo.id);
     setNewName("");
     setSearch("");
+    markDirty(advisor.id, convo.id);
+    refreshSyncMeta();
   }
 
   function goTo(stepKey) {
     if (stepKey === "home") { setActiveId(null); return; }
+    var changedId = null;
     setConvos(convos.map(function (c) {
-      return c.id === activeId ? Object.assign({}, c, { step: stepKey, updated: Date.now() }) : c;
+      if (c.id !== activeId) return c;
+      changedId = c.id;
+      return Object.assign({}, c, { step: stepKey, updated: Date.now() });
     }));
+    if (changedId) { markDirty(advisor.id, changedId); refreshSyncMeta(); }
   }
 
   // Copying a line means it got sent — on the "chase" steps the advisor
   // stays put, so without this the conversation would look untouched.
   function touch() {
+    var changedId = null;
     setConvos(convos.map(function (c) {
-      return c.id === activeId ? Object.assign({}, c, { updated: Date.now() }) : c;
+      if (c.id !== activeId) return c;
+      changedId = c.id;
+      return Object.assign({}, c, { updated: Date.now() });
     }));
+    if (changedId) { markDirty(advisor.id, changedId); refreshSyncMeta(); }
   }
 
   function removeConvo(id) {
     setConvos(convos.filter(function (c) { return c.id !== id; }));
     if (activeId === id) setActiveId(null);
+    markDeleted(advisor.id, id);
+    refreshSyncMeta();
+  }
+
+  // Idempotent by construction: merges cloud rows into local by id, so
+  // tapping Restore twice (or restoring after already restoring) can never
+  // create duplicates — it just re-applies the same merge.
+  function doRestore() {
+    if (!restoreOffer || !advisor) return;
+    var map = {};
+    convos.forEach(function (c) { map[c.id] = c; });
+    restoreOffer.rows.forEach(function (r) { var m = fromRemoteRow(r); map[m.id] = m; });
+    var merged = Object.keys(map).map(function (k) { return map[k]; });
+    setConvos(merged);
+    lset("br-restore-offered-" + advisor.id, true);
+    var count = restoreOffer.rows.length;
+    setRestoreOffer(null);
+    flash("Restored " + count + " conversation" + (count === 1 ? "" : "s"));
+  }
+
+  function dismissRestore() {
+    if (advisor) lset("br-restore-offered-" + advisor.id, true);
+    setRestoreOffer(null);
+  }
+
+  function checkRestoreManually() {
+    if (!advisor) return;
+    if (!supabaseClient) { flash("Cloud isn't configured yet"); return; }
+    fetchCloudConvos(advisor.id).then(function (res) {
+      if (res.error) { flash("Couldn't reach the backup"); return; }
+      if (res.data && res.data.length > 0) setRestoreOffer({ rows: res.data });
+      else flash("No cloud backup found for " + advisor.name);
+    });
+  }
+
+  function syncNow() {
+    if (!advisor) return;
+    if (!supabaseClient) { flash("Cloud isn't configured yet"); return; }
+    runSync(advisor.id).then(function () { refreshSyncMeta(); flash("Sync complete"); });
   }
 
   var toastEl = toast ? h("div", {
@@ -493,13 +905,40 @@ function App() {
     className: "px-5 py-2.5 rounded-full text-sm font-semibold shadow-lg"
   }, toast.msg)) : null;
 
+  if (!advisor || screen === "identity") {
+    return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
+      h(IdentityScreen, {
+        mode: advisor ? "change" : "first-run",
+        currentName: advisor && advisor.name,
+        onSelect: handleAdvisorSelected,
+        onCancel: advisor ? function () { setScreen("settings"); } : null
+      }),
+      toastEl
+    );
+  }
+
+  if (screen === "settings") {
+    return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
+      h(SettingsScreen, {
+        advisor: advisor, convos: convos, syncMeta: syncMeta,
+        onBack: function () { setScreen("home"); },
+        onChangeIdentity: function () { setScreen("identity"); },
+        onSyncNow: syncNow,
+        onCheckRestore: checkRestoreManually
+      }),
+      toastEl
+    );
+  }
+
   if (!active) {
     return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
       h(HomeScreen, {
         convos: convos, newName: newName, setNewName: setNewName,
         search: search, setSearch: setSearch,
         sortMode: sortMode, setSortMode: setSortMode,
-        onStart: startNew, onOpen: setActiveId, onRemove: removeConvo
+        onStart: startNew, onOpen: setActiveId, onRemove: removeConvo,
+        onOpenSettings: function () { setScreen("settings"); },
+        restoreOffer: restoreOffer, onRestore: doRestore, onDismissRestore: dismissRestore
       }),
       toastEl
     );
@@ -529,10 +968,37 @@ function HomeScreen(props) {
   return h("div", { className: "max-w-md mx-auto px-5 pt-8 pb-16" },
     h("div", { className: "flex items-center gap-3.5 mb-7" },
       h(Shield, { size: 46, uid: "home" }),
-      h("div", { className: "min-w-0" },
+      h("div", { className: "min-w-0 flex-1" },
         h("div", { style: { color: C.gold }, className: "text-[10px] tracking-[0.28em] uppercase font-mono mb-0.5" }, "Battle River Unit"),
         h("div", { className: "font-display text-[26px] leading-tight" }, "Chat Selling Script"),
         h("div", { style: { color: C.muted }, className: "text-[13px] mt-0.5" }, "Traditional \u2014 Sell Thru Chat")
+      ),
+      h("button", {
+        onClick: props.onOpenSettings,
+        style: { color: C.muted, borderColor: C.line },
+        className: "w-9 h-9 shrink-0 rounded-full border flex items-center justify-center active:opacity-60",
+        "aria-label": "Settings"
+      }, "\u2699")
+    ),
+
+    props.restoreOffer && h("div", {
+      style: { background: C.surfaceAlt, borderColor: C.gold },
+      className: "rounded-2xl border p-4 mb-6"
+    },
+      h("div", { className: "text-[14px] leading-relaxed mb-3" },
+        "We found " + props.restoreOffer.rows.length + " saved conversation" + (props.restoreOffer.rows.length === 1 ? "" : "s") +
+        " backed up to the cloud. Restore " + (props.restoreOffer.rows.length === 1 ? "it" : "them") + " to this device?"),
+      h("div", { className: "flex gap-2" },
+        h("button", {
+          onClick: props.onRestore,
+          style: { background: C.gold, color: "#06223B" },
+          className: "flex-1 py-2.5 rounded-xl text-sm font-bold active:scale-[0.98] transition-transform"
+        }, "Restore"),
+        h("button", {
+          onClick: props.onDismissRestore,
+          style: { color: C.muted },
+          className: "px-4 py-2.5 text-sm font-mono active:opacity-60"
+        }, "Not now")
       )
     ),
 
@@ -634,6 +1100,146 @@ function HomeScreen(props) {
 
     convos.length === 0 && h("div", { style: { color: C.muted }, className: "text-sm text-center px-6 leading-relaxed mt-2" },
       "Start a conversation and the script will remember exactly where you left off with each client.")
+  );
+}
+
+// One-time (or advisor-initiated) identity picker. Mode "first-run" blocks
+// the rest of the app until a name is picked and offers no cancel. Mode
+// "change" is reached voluntarily from Settings and can be backed out of.
+function IdentityScreen(props) {
+  var listState = useState(null); var roster = listState[0], setRoster = listState[1]; // null = loading
+  var errState = useState(null); var err = errState[0], setErr = errState[1];
+  var reloadState = useState(0); var reloadTick = reloadState[0], setReloadTick = reloadState[1];
+
+  useEffect(function () {
+    var cancelled = false;
+    setRoster(null); setErr(null);
+    fetchRoster().then(function (res) {
+      if (cancelled) return;
+      if (res.error) { setErr(res.error); setRoster([]); }
+      else setRoster(res.data);
+    });
+    return function () { cancelled = true; };
+  }, [reloadTick]);
+
+  return h("div", { className: "max-w-md mx-auto px-5 pt-10 pb-16" },
+    h("div", { className: "flex items-center gap-3.5 mb-8" },
+      h(Shield, { size: 44, uid: "identity" }),
+      h("div", null,
+        h("div", { style: { color: C.gold }, className: "text-[10px] tracking-[0.28em] uppercase font-mono mb-0.5" }, "Battle River Unit"),
+        h("div", { className: "font-display text-[22px] leading-tight" },
+          props.mode === "change" ? "Change identity" : "Who's using this device?")
+      )
+    ),
+
+    props.mode === "first-run" && h("div", { style: { color: C.muted }, className: "text-[13px] leading-relaxed mb-6" },
+      "Pick your name once. This just attributes your conversations and backs them up under the right advisor — there's no password."),
+
+    props.mode === "change" && h("div", {
+      style: { background: C.surfaceAlt, borderColor: C.goldDim, color: C.goldSoft },
+      className: "rounded-xl border p-3.5 text-[13px] leading-relaxed mb-6"
+    }, "Switching identity won't delete or merge anything. Conversations already on this device stay saved under " +
+      (props.currentName || "the current advisor") + ". The new advisor starts from their own backup, not from what's here now."),
+
+    err && h("div", {
+      style: { background: "#2A1512", borderColor: urgencyColor("high"), color: "#F5A38C" },
+      className: "rounded-xl border p-3.5 text-[13px] leading-relaxed mb-4"
+    }, err),
+
+    roster === null && h("div", { style: { color: C.muted }, className: "text-sm text-center py-10" }, "Loading advisor list…"),
+
+    roster !== null && roster.length === 0 && h("div", { className: "mb-4" },
+      h("button", {
+        onClick: function () { setReloadTick(reloadTick + 1); },
+        style: { background: C.gold, color: "#06223B" },
+        className: "w-full py-3.5 rounded-xl font-bold active:scale-[0.98] transition-transform"
+      }, "Try again")
+    ),
+
+    roster && roster.length > 0 && h("div", { className: "space-y-2 mb-4" },
+      roster.map(function (r) {
+        return h("button", {
+          key: r.id,
+          onClick: function () { props.onSelect(r); },
+          style: { background: C.surface, borderColor: C.line },
+          className: "w-full text-left px-4 py-3.5 rounded-xl border text-[15px] active:scale-[0.99] transition-transform flex items-center justify-between gap-3"
+        },
+          h("span", null, r.name),
+          h("span", { style: { color: C.muted } }, "›")
+        );
+      })
+    ),
+
+    props.onCancel && h("button", {
+      onClick: props.onCancel,
+      style: { color: C.muted },
+      className: "w-full mt-2 py-3 text-sm font-mono active:opacity-60"
+    }, "cancel")
+  );
+}
+
+function SettingsScreen(props) {
+  var advisor = props.advisor, convos = props.convos, meta = props.syncMeta;
+  return h("div", { className: "max-w-md mx-auto pb-16" },
+    h("div", {
+      style: { background: C.surface, borderColor: C.line },
+      className: "px-5 pt-5 pb-4 border-b sticky top-0 z-10"
+    },
+      h("button", { onClick: props.onBack, style: { color: C.muted }, className: "text-sm font-mono active:opacity-60 mb-3" }, "‹ all chats"),
+      h("div", { className: "font-display text-2xl" }, "Settings")
+    ),
+
+    h("div", { className: "px-5 pt-5" },
+
+      h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" }, "Identity"),
+      h("div", { style: { background: C.surface, borderColor: C.line }, className: "rounded-2xl border p-4 mb-6" },
+        h("div", { className: "text-[15px] font-semibold mb-1" }, advisor ? advisor.name : "Not set"),
+        h("div", { style: { color: C.muted }, className: "text-[12px] mb-3" }, "Conversations on this device back up under this name."),
+        h("button", {
+          onClick: props.onChangeIdentity,
+          style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
+          className: "w-full py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
+        }, "Change identity")
+      ),
+
+      h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" }, "Cloud backup"),
+      h("div", { style: { background: C.surface, borderColor: C.line }, className: "rounded-2xl border p-4 mb-6" },
+        h("div", { className: "text-[13px] mb-3" }, syncStatusText(meta)),
+        h("div", { className: "flex gap-2" },
+          h("button", {
+            onClick: props.onSyncNow,
+            style: { background: C.gold, color: "#06223B" },
+            className: "flex-1 py-2.5 rounded-xl text-sm font-bold active:scale-[0.98] transition-transform"
+          }, "Sync now"),
+          h("button", {
+            onClick: props.onCheckRestore,
+            style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
+            className: "flex-1 py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
+          }, "Restore from cloud")
+        )
+      ),
+
+      h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" }, "Export"),
+      h("div", { style: { background: C.surface, borderColor: C.line }, className: "rounded-2xl border p-4 mb-6" },
+        h("div", { style: { color: C.muted }, className: "text-[12px] mb-3" }, "A personal copy of everything on this device — not a substitute for the cloud backup above."),
+        h("div", { className: "flex gap-2" },
+          h("button", {
+            onClick: function () { exportJSON(advisor, convos); },
+            style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
+            className: "flex-1 py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
+          }, "Export JSON"),
+          h("button", {
+            onClick: function () { exportCSV(advisor, convos); },
+            style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
+            className: "flex-1 py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
+          }, "Export CSV")
+        )
+      ),
+
+      h("div", { style: { color: C.muted }, className: "text-[11px] leading-relaxed" },
+        "This device is identified as " + (advisor ? advisor.name : "no one") +
+        " by name only — there's no password. Anyone with access to this device could pick a different name. Treat this as attribution, not account security.")
+    )
   );
 }
 
