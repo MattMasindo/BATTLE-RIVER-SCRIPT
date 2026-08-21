@@ -84,13 +84,13 @@ var PROSPECTS_TABLE = "prospect_names";
 // see PROJECT_TRACKER for the full setup steps. Leave the placeholder in
 // place and the digest opt-in UI simply stays hidden until this is filled
 // in, the same "safe until configured" pattern as SUPABASE_URL above. ---
-var ONESIGNAL_APP_ID = "Ya746ba97-d94b-4a3f-bd9a-88ff89eaf7de";
+var ONESIGNAL_APP_ID = "a746ba97-d94b-4a3f-bd9a-88ff89eaf7de";
  
 function isOneSignalConfigured() {
   return ONESIGNAL_APP_ID.indexOf("YOUR-ONESIGNAL") === -1;
 }
  
-var APP_VERSION = "1.3.3-safe-area";
+var APP_VERSION = "1.3.4-onesignal-configured";
  
 function isSupabaseConfigured() {
   return SUPABASE_URL.indexOf("YOUR-PROJECT") === -1 && SUPABASE_ANON_KEY.indexOf("YOUR-ANON") === -1;
