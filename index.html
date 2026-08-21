@@ -78,13 +78,13 @@ var PROSPECTS_TABLE = "prospect_names";
 // see PROJECT_TRACKER for the full setup steps. Leave the placeholder in
 // place and the digest opt-in UI simply stays hidden until this is filled
 // in, the same "safe until configured" pattern as SUPABASE_URL above. ---
-var ONESIGNAL_APP_ID = "a746ba97-d94b-4a3f-bd9a-88ff89eaf7de";
+var ONESIGNAL_APP_ID = "YOUR-ONESIGNAL-APP-ID";
  
 function isOneSignalConfigured() {
   return ONESIGNAL_APP_ID.indexOf("YOUR-ONESIGNAL") === -1;
 }
  
-var APP_VERSION = "1.3.0-patch3-pin-digest";
+var APP_VERSION = "1.3.1-safari-push-fix";
  
 function isSupabaseConfigured() {
   return SUPABASE_URL.indexOf("YOUR-PROJECT") === -1 && SUPABASE_ANON_KEY.indexOf("YOUR-ANON") === -1;
@@ -607,21 +607,33 @@ function getOneSignalSubscriptionId() {
 async function enableDigestPush(advisorId) {
   if (!supabaseClient) return { error: "Cloud isn't configured yet." };
   if (!isOneSignalConfigured()) return { error: "Push isn't configured yet." };
-  return new Promise(function (resolve) {
-    window.OneSignalDeferred = window.OneSignalDeferred || [];
-    window.OneSignalDeferred.push(async function (OneSignal) {
-      try {
-        await OneSignal.Notifications.requestPermission();
-        var subId = OneSignal.User.PushSubscription.id || null;
-        if (!subId) { resolve({ error: "Notifications weren't enabled \u2014 check your browser's permission settings." }); return; }
-        var res = await supabaseClient.from("advisor_push_subs").upsert({
-          advisor_id: advisorId, onesignal_player_id: subId, digest_opt_in: true, updated_at: new Date().toISOString()
-        }, { onConflict: "advisor_id" });
-        if (res.error) { resolve({ error: "Saved locally, but couldn't reach the server \u2014 try again." }); return; }
-        resolve({ data: true });
-      } catch (e) { resolve({ error: "Couldn't enable notifications \u2014 try again." }); }
-    });
-  });
+  // Deliberately NOT routed through OneSignalDeferred.push() here \u2014 Safari
+  // only shows its permission prompt when requestPermission() is called
+  // directly within the click's own call stack. Queuing it onto OneSignal's
+  // deferred array (fine for init, which needs no user gesture) breaks that
+  // chain on Safari specifically: the prompt never appears and the promise
+  // just hangs, which is exactly the "stuck on Working\u2026" symptom this fixes.
+  // By the time Settings is reachable, initOneSignal() (called at module
+  // load) has had many seconds to finish, so window.OneSignal is expected
+  // to already be the real SDK object, not just the queue.
+  if (!window.OneSignal || !window.OneSignal.Notifications) {
+    return { error: "Notifications are still loading \u2014 wait a moment and try again." };
+  }
+  try {
+    var timedOut = { timedOut: true };
+    var result = await Promise.race([
+      window.OneSignal.Notifications.requestPermission(),
+      new Promise(function (resolve) { setTimeout(function () { resolve(timedOut); }, 15000); })
+    ]);
+    if (result === timedOut) return { error: "No response from the notification prompt \u2014 try again." };
+    var subId = window.OneSignal.User.PushSubscription.id || null;
+    if (!subId) return { error: "Notifications weren't enabled \u2014 check your browser's permission settings." };
+    var res = await supabaseClient.from("advisor_push_subs").upsert({
+      advisor_id: advisorId, onesignal_player_id: subId, digest_opt_in: true, updated_at: new Date().toISOString()
+    }, { onConflict: "advisor_id" });
+    if (res.error) return { error: "Saved locally, but couldn't reach the server \u2014 try again." };
+    return { data: true };
+  } catch (e) { return { error: "Couldn't enable notifications \u2014 try again." }; }
 }
  
 async function disableDigestPush(advisorId) {
