@@ -21,6 +21,9 @@
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <!-- Patch 1: Supabase browser client (public/anon key only — see CONFIG block below) -->
 <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+<!-- Patch 3: OneSignal Web Push SDK v16 (App ID only — see CONFIG block below).
+     Requires OneSignalSDKWorker.js at the site root — see PROJECT_TRACKER. -->
+<script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
 <style>
   body { font-family: 'Inter', sans-serif; background: #061A2E; -webkit-tap-highlight-color: transparent; }
   .font-display { font-family: 'Space Grotesk', sans-serif; }
@@ -70,7 +73,18 @@ var CONVERSATIONS_TABLE = "conversation_backups";
 // conversation. Same soft-delete/tombstone pattern as conversations. ---
 var PROSPECTS_TABLE = "prospect_names";
  
-var APP_VERSION = "1.2.2-add-advisor";
+// --- Patch 3: OneSignal Web Push app id. Get this from the OneSignal
+// dashboard (Settings > Keys & IDs) after creating a Web Push app there —
+// see PROJECT_TRACKER for the full setup steps. Leave the placeholder in
+// place and the digest opt-in UI simply stays hidden until this is filled
+// in, the same "safe until configured" pattern as SUPABASE_URL above. ---
+var ONESIGNAL_APP_ID = "a746ba97-d94b-4a3f-bd9a-88ff89eaf7de";
+ 
+function isOneSignalConfigured() {
+  return ONESIGNAL_APP_ID.indexOf("YOUR-ONESIGNAL") === -1;
+}
+ 
+var APP_VERSION = "1.3.0-patch3-pin-digest";
  
 function isSupabaseConfigured() {
   return SUPABASE_URL.indexOf("YOUR-PROJECT") === -1 && SUPABASE_ANON_KEY.indexOf("YOUR-ANON") === -1;
@@ -84,6 +98,12 @@ try {
     supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
   }
 } catch (e) { supabaseClient = null; }
+ 
+// Patch 3: OneSignal init lives at module scope (not inside a component)
+// because it only ever needs to happen once per page load, same reasoning
+// as the Supabase client above. initOneSignal() itself is a no-op until
+// ONESIGNAL_APP_ID is filled in.
+try { initOneSignal(); } catch (e) {}
  
 // Battle River shield, drawn inline so there's no image file to host.
 // The clip id is per-instance so multiple shields can render at once,
@@ -531,6 +551,96 @@ async function addSelfAsAdvisor(name) {
     var r = res.data;
     return { data: { id: r[ADVISOR_ID_COLUMN], name: r[ADVISOR_NAME_COLUMN] } };
   } catch (e) { return { error: "Couldn't add you to the roster." }; }
+}
+ 
+// ======================================================================
+// PATCH 3 — PIN gate. verify_advisor_pin() lives entirely server-side
+// (SECURITY DEFINER, never returns the hash) — see SUPABASE_MIGRATIONS_PATCH3.sql.
+// The RPC itself decides "first time, set it" vs "compare it"; this client
+// helper just calls it and turns the jsonb result into something the UI
+// can read plainly.
+// ======================================================================
+async function verifyAdvisorPin(advisorId, pin) {
+  if (!supabaseClient) return { error: "Cloud isn't configured yet." };
+  try {
+    var res = await supabaseClient.rpc("verify_advisor_pin", { p_advisor_id: advisorId, p_pin: pin });
+    if (res.error) return { error: "Couldn't check that PIN \u2014 try again." };
+    var d = res.data || {};
+    if (d.error === "pin_too_short") return { error: "PIN must be at least 4 digits." };
+    if (d.error === "not_found") return { error: "That advisor couldn't be found." };
+    if (d.error === "locked") return { error: "Too many wrong tries \u2014 wait a few minutes and try again." };
+    if (!d.ok) return { error: "Wrong PIN \u2014 try again." };
+    return { data: { created: !!d.created } };
+  } catch (e) { return { error: "Couldn't reach the server \u2014 try again." }; }
+}
+ 
+// ======================================================================
+// PATCH 3 — daily overdue digest via OneSignal Web Push. Everything here
+// no-ops quietly if ONESIGNAL_APP_ID is still the placeholder or the SDK
+// hasn't loaded, matching the existing "safe until configured" pattern.
+// ======================================================================
+function initOneSignal() {
+  if (!isOneSignalConfigured()) return;
+  window.OneSignalDeferred = window.OneSignalDeferred || [];
+  window.OneSignalDeferred.push(function (OneSignal) {
+    OneSignal.init({ appId: ONESIGNAL_APP_ID });
+  });
+}
+ 
+// Reads the current push subscription id, if any, from the OneSignal SDK.
+// Resolves null (never rejects) if OneSignal isn't ready yet or isn't
+// configured \u2014 callers treat null as "no subscription yet".
+function getOneSignalSubscriptionId() {
+  return new Promise(function (resolve) {
+    if (!isOneSignalConfigured() || !window.OneSignalDeferred) { resolve(null); return; }
+    window.OneSignalDeferred.push(function (OneSignal) {
+      try { resolve(OneSignal.User.PushSubscription.id || null); }
+      catch (e) { resolve(null); }
+    });
+  });
+}
+ 
+// Prompts for notification permission (if not already granted/denied) and
+// upserts the resulting subscription id + opt-in flag to advisor_push_subs.
+// Safe to call repeatedly \u2014 re-subscribing on a new device simply
+// overwrites the previous row for this advisor.
+async function enableDigestPush(advisorId) {
+  if (!supabaseClient) return { error: "Cloud isn't configured yet." };
+  if (!isOneSignalConfigured()) return { error: "Push isn't configured yet." };
+  return new Promise(function (resolve) {
+    window.OneSignalDeferred = window.OneSignalDeferred || [];
+    window.OneSignalDeferred.push(async function (OneSignal) {
+      try {
+        await OneSignal.Notifications.requestPermission();
+        var subId = OneSignal.User.PushSubscription.id || null;
+        if (!subId) { resolve({ error: "Notifications weren't enabled \u2014 check your browser's permission settings." }); return; }
+        var res = await supabaseClient.from("advisor_push_subs").upsert({
+          advisor_id: advisorId, onesignal_player_id: subId, digest_opt_in: true, updated_at: new Date().toISOString()
+        }, { onConflict: "advisor_id" });
+        if (res.error) { resolve({ error: "Saved locally, but couldn't reach the server \u2014 try again." }); return; }
+        resolve({ data: true });
+      } catch (e) { resolve({ error: "Couldn't enable notifications \u2014 try again." }); }
+    });
+  });
+}
+ 
+async function disableDigestPush(advisorId) {
+  if (!supabaseClient) return { error: "Cloud isn't configured yet." };
+  try {
+    var res = await supabaseClient.from("advisor_push_subs")
+      .upsert({ advisor_id: advisorId, digest_opt_in: false, updated_at: new Date().toISOString() }, { onConflict: "advisor_id" });
+    if (res.error) return { error: "Couldn't reach the server \u2014 try again." };
+    return { data: true };
+  } catch (e) { return { error: "Couldn't reach the server \u2014 try again." }; }
+}
+ 
+async function fetchDigestOptIn(advisorId) {
+  if (!supabaseClient) return { data: false };
+  try {
+    var res = await supabaseClient.from("advisor_push_subs").select("digest_opt_in").eq("advisor_id", advisorId).maybeSingle();
+    if (res.error || !res.data) return { data: false };
+    return { data: !!res.data.digest_opt_in };
+  } catch (e) { return { data: false }; }
 }
  
 async function fetchCloudConvos(advisorId) {
@@ -1697,6 +1807,13 @@ function IdentityScreen(props) {
   var newAdvisorNameState = useState(""); var newAdvisorName = newAdvisorNameState[0], setNewAdvisorName = newAdvisorNameState[1];
   var newAdvisorBusyState = useState(false); var newAdvisorBusy = newAdvisorBusyState[0], setNewAdvisorBusy = newAdvisorBusyState[1];
   var newAdvisorErrState = useState(null); var newAdvisorErr = newAdvisorErrState[0], setNewAdvisorErr = newAdvisorErrState[1];
+  // Patch 3: PIN gate. pinTarget is the roster row (or freshly self-added
+  // advisor) currently being claimed \u2014 while it's set, the roster list
+  // and "add my name" flow are hidden in favor of a single PIN prompt.
+  var pinTargetState = useState(null); var pinTarget = pinTargetState[0], setPinTarget = pinTargetState[1];
+  var pinValueState = useState(""); var pinValue = pinValueState[0], setPinValue = pinValueState[1];
+  var pinBusyState = useState(false); var pinBusy = pinBusyState[0], setPinBusy = pinBusyState[1];
+  var pinErrState = useState(null); var pinErr = pinErrState[0], setPinErr = pinErrState[1];
  
   useEffect(function () {
     var cancelled = false;
@@ -1716,8 +1833,35 @@ function IdentityScreen(props) {
     addSelfAsAdvisor(newAdvisorName).then(function (res) {
       setNewAdvisorBusy(false);
       if (res.error) { setNewAdvisorErr(res.error); return; }
-      if (props.onAdded) { props.onAdded(res.data); }
-      else { props.onSelect(res.data); }
+      // Adding a teammate from an already-signed-in device (add-advisor
+      // mode) never claims that identity on this device, so it skips the
+      // PIN step entirely \u2014 the real teammate sets their own PIN the
+      // first time they pick their own name.
+      if (props.mode === "add-advisor") { props.onAdded(res.data); return; }
+      openPinFor(res.data);
+    });
+  }
+ 
+  function openPinFor(row) {
+    setPinTarget(row);
+    setPinValue("");
+    setPinErr(null);
+  }
+ 
+  function submitPin() {
+    if (pinBusy || !pinTarget) return;
+    if (pinValue.trim().length < 4) { setPinErr("PIN must be at least 4 digits."); return; }
+    setPinErr(null);
+    setPinBusy(true);
+    verifyAdvisorPin(pinTarget.id, pinValue.trim()).then(function (res) {
+      setPinBusy(false);
+      if (res.error) { setPinErr(res.error); return; }
+      var target = pinTarget;
+      setPinTarget(null);
+      // openPinFor() is only ever reached in first-run/change mode (the
+      // add-advisor path returns before calling it), so onSelect is always
+      // the right callback here.
+      props.onSelect(target);
     });
   }
  
@@ -1743,73 +1887,115 @@ function IdentityScreen(props) {
     }, "Switching identity won't delete or merge anything. Conversations already on this device stay saved under " +
       (props.currentName || "the current advisor") + ". The new advisor starts from their own backup, not from what's here now."),
  
-    err && h("div", {
-      style: { background: "#2A1512", borderColor: urgencyColor("high"), color: "#F5A38C" },
-      className: "rounded-xl border p-3.5 text-[13px] leading-relaxed mb-4"
-    }, err),
+    !pinTarget && h("div", null,
+      err && h("div", {
+        style: { background: "#2A1512", borderColor: urgencyColor("high"), color: "#F5A38C" },
+        className: "rounded-xl border p-3.5 text-[13px] leading-relaxed mb-4"
+      }, err),
  
-    roster === null && h("div", { style: { color: C.muted }, className: "text-sm text-center py-10" }, "Loading advisor list…"),
+      roster === null && h("div", { style: { color: C.muted }, className: "text-sm text-center py-10" }, "Loading advisor list…"),
  
-    roster !== null && roster.length === 0 && h("div", { className: "mb-4" },
+      roster !== null && roster.length === 0 && h("div", { className: "mb-4" },
+        h("button", {
+          onClick: function () { setReloadTick(reloadTick + 1); },
+          style: { background: C.gold, color: "#06223B" },
+          className: "w-full py-3.5 rounded-xl font-bold active:scale-[0.98] transition-transform"
+        }, "Try again")
+      ),
+ 
+      roster && roster.length > 0 && props.mode !== "add-advisor" && h("div", { className: "space-y-2 mb-4" },
+        roster.map(function (r) {
+          return h("button", {
+            key: r.id,
+            onClick: function () { openPinFor(r); },
+            style: { background: C.surface, borderColor: C.line },
+            className: "w-full text-left px-4 py-3.5 rounded-xl border text-[15px] active:scale-[0.99] transition-transform flex items-center justify-between gap-3"
+          },
+            h("span", null, r.name),
+            h("span", { style: { color: C.muted } }, "›")
+          );
+        })
+      ),
+ 
+      !newAdvisorOpen && h("button", {
+        onClick: function () { setNewAdvisorOpen(true); },
+        style: { color: C.gold },
+        className: "w-full py-3 text-sm font-semibold active:opacity-60 mb-2"
+      }, "I'm new here \u2014 add my name"),
+ 
+      newAdvisorOpen && h("div", {
+        style: { background: C.surfaceAlt, borderColor: C.line },
+        className: "rounded-xl border p-4 mb-4"
+      },
+        h("div", { style: { color: C.muted }, className: "text-[12px] leading-relaxed mb-3" },
+          "Adds your name to the shared advisor list so any device can back your conversations up under you."),
+        newAdvisorErr && h("div", { style: { color: "#F5A38C" }, className: "text-[12px] mb-2" }, newAdvisorErr),
+        h("input", {
+          autoFocus: true,
+          value: newAdvisorName,
+          onChange: function (ev) { setNewAdvisorName(ev.target.value); },
+          onKeyDown: function (ev) { if (ev.key === "Enter") submitNewAdvisor(); },
+          placeholder: "Your full name",
+          style: { background: C.bg, borderColor: C.line, color: C.text },
+          className: "w-full px-4 py-3 rounded-xl border outline-none text-base mb-3"
+        }),
+        h("div", { className: "flex gap-2" },
+          h("button", {
+            onClick: submitNewAdvisor,
+            disabled: newAdvisorBusy,
+            style: { background: C.gold, color: "#06223B", opacity: newAdvisorBusy ? 0.6 : 1 },
+            className: "flex-1 py-2.5 rounded-xl text-sm font-bold active:scale-[0.98] transition-transform"
+          }, newAdvisorBusy ? "Adding\u2026" : "Add me"),
+          h("button", {
+            onClick: function () {
+              if (props.mode === "add-advisor" && props.onCancel) { props.onCancel(); return; }
+              setNewAdvisorOpen(false); setNewAdvisorErr(null);
+            },
+            style: { color: C.muted },
+            className: "px-4 py-2.5 text-sm font-mono active:opacity-60"
+          }, "Cancel")
+        )
+      )
+    ),
+ 
+    // Patch 3: PIN entry \u2014 replaces the roster/add-advisor UI the moment
+    // a name has been tapped (or just self-added). Copy is deliberately
+    // non-committal about whether a PIN already exists for this advisor,
+    // since the client never knows that in advance \u2014 verify_advisor_pin()
+    // decides server-side whether this call is a first-time "create" or a
+    // real "compare".
+    pinTarget && h("div", null,
       h("button", {
-        onClick: function () { setReloadTick(reloadTick + 1); },
-        style: { background: C.gold, color: "#06223B" },
-        className: "w-full py-3.5 rounded-xl font-bold active:scale-[0.98] transition-transform"
-      }, "Try again")
-    ),
+        onClick: function () { setPinTarget(null); },
+        style: { color: C.muted },
+        className: "text-sm font-mono active:opacity-60 mb-4"
+      }, "\u2039 back"),
  
-    roster && roster.length > 0 && props.mode !== "add-advisor" && h("div", { className: "space-y-2 mb-4" },
-      roster.map(function (r) {
-        return h("button", {
-          key: r.id,
-          onClick: function () { props.onSelect(r); },
-          style: { background: C.surface, borderColor: C.line },
-          className: "w-full text-left px-4 py-3.5 rounded-xl border text-[15px] active:scale-[0.99] transition-transform flex items-center justify-between gap-3"
-        },
-          h("span", null, r.name),
-          h("span", { style: { color: C.muted } }, "›")
-        );
-      })
-    ),
+      h("div", { style: { color: C.muted }, className: "text-[13px] leading-relaxed mb-4" },
+        "Enter the PIN for " + pinTarget.name + ". If this is the first time anyone has signed in as them, whatever you type here becomes their PIN going forward \u2014 make sure it's really " + pinTarget.name + " typing it."),
  
-    !newAdvisorOpen && h("button", {
-      onClick: function () { setNewAdvisorOpen(true); },
-      style: { color: C.gold },
-      className: "w-full py-3 text-sm font-semibold active:opacity-60 mb-2"
-    }, "I'm new here \u2014 add my name"),
+      pinErr && h("div", { style: { color: "#F5A38C" }, className: "text-[13px] mb-3" }, pinErr),
  
-    newAdvisorOpen && h("div", {
-      style: { background: C.surfaceAlt, borderColor: C.line },
-      className: "rounded-xl border p-4 mb-4"
-    },
-      h("div", { style: { color: C.muted }, className: "text-[12px] leading-relaxed mb-3" },
-        "Adds your name to the shared advisor list so any device can back your conversations up under you."),
-      newAdvisorErr && h("div", { style: { color: "#F5A38C" }, className: "text-[12px] mb-2" }, newAdvisorErr),
       h("input", {
         autoFocus: true,
-        value: newAdvisorName,
-        onChange: function (ev) { setNewAdvisorName(ev.target.value); },
-        onKeyDown: function (ev) { if (ev.key === "Enter") submitNewAdvisor(); },
-        placeholder: "Your full name",
-        style: { background: C.bg, borderColor: C.line, color: C.text },
-        className: "w-full px-4 py-3 rounded-xl border outline-none text-base mb-3"
+        type: "password",
+        inputMode: "numeric",
+        pattern: "[0-9]*",
+        maxLength: 6,
+        value: pinValue,
+        onChange: function (ev) { setPinValue(ev.target.value.replace(/[^0-9]/g, "")); },
+        onKeyDown: function (ev) { if (ev.key === "Enter") submitPin(); },
+        placeholder: "4\u20136 digit PIN",
+        style: { background: C.bg, borderColor: C.line, color: C.text, letterSpacing: "0.3em" },
+        className: "w-full px-4 py-3 rounded-xl border outline-none text-lg text-center mb-4"
       }),
-      h("div", { className: "flex gap-2" },
-        h("button", {
-          onClick: submitNewAdvisor,
-          disabled: newAdvisorBusy,
-          style: { background: C.gold, color: "#06223B", opacity: newAdvisorBusy ? 0.6 : 1 },
-          className: "flex-1 py-2.5 rounded-xl text-sm font-bold active:scale-[0.98] transition-transform"
-        }, newAdvisorBusy ? "Adding\u2026" : "Add me"),
-        h("button", {
-          onClick: function () {
-            if (props.mode === "add-advisor" && props.onCancel) { props.onCancel(); return; }
-            setNewAdvisorOpen(false); setNewAdvisorErr(null);
-          },
-          style: { color: C.muted },
-          className: "px-4 py-2.5 text-sm font-mono active:opacity-60"
-        }, "Cancel")
-      )
+ 
+      h("button", {
+        onClick: submitPin,
+        disabled: pinBusy,
+        style: { background: C.gold, color: "#06223B", opacity: pinBusy ? 0.6 : 1 },
+        className: "w-full py-3.5 rounded-xl font-bold active:scale-[0.98] transition-transform"
+      }, pinBusy ? "Checking\u2026" : "Continue")
     ),
  
     props.onCancel && h("button", {
@@ -1822,6 +2008,38 @@ function IdentityScreen(props) {
  
 function SettingsScreen(props) {
   var advisor = props.advisor, convos = props.convos, meta = props.syncMeta;
+ 
+  // Patch 3: daily digest opt-in. Loaded fresh whenever Settings opens for
+  // this advisor \u2014 it's cheap, and keeps this screen honest if the opt-in
+  // was changed from another device.
+  var digestOptInState = useState(false); var digestOptIn = digestOptInState[0], setDigestOptIn = digestOptInState[1];
+  var digestBusyState = useState(false); var digestBusy = digestBusyState[0], setDigestBusy = digestBusyState[1];
+  var digestErrState = useState(null); var digestErr = digestErrState[0], setDigestErr = digestErrState[1];
+ 
+  useEffect(function () {
+    if (!advisor) return;
+    fetchDigestOptIn(advisor.id).then(function (res) { setDigestOptIn(!!res.data); });
+  }, [advisor && advisor.id]);
+ 
+  function toggleDigest() {
+    if (digestBusy || !advisor) return;
+    setDigestErr(null);
+    setDigestBusy(true);
+    if (digestOptIn) {
+      disableDigestPush(advisor.id).then(function (res) {
+        setDigestBusy(false);
+        if (res.error) { setDigestErr(res.error); return; }
+        setDigestOptIn(false);
+      });
+    } else {
+      enableDigestPush(advisor.id).then(function (res) {
+        setDigestBusy(false);
+        if (res.error) { setDigestErr(res.error); return; }
+        setDigestOptIn(true);
+      });
+    }
+  }
+ 
   return h("div", { className: "max-w-md mx-auto pb-16" },
     h("div", {
       style: { background: C.surface, borderColor: C.line },
@@ -1875,6 +2093,26 @@ function SettingsScreen(props) {
             style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
             className: "flex-1 py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
           }, "Restore from cloud")
+        )
+      ),
+ 
+      isOneSignalConfigured() && h("div", null,
+        h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" }, "Daily overdue digest"),
+        h("div", { style: { background: C.surface, borderColor: C.line }, className: "rounded-2xl border p-4 mb-6" },
+          h("div", { style: { color: C.muted }, className: "text-[12px] mb-3 leading-relaxed" },
+            "A once-a-day notification listing anything that's gone 3+ days without a touch \u2014 sent even if the app isn't open. Nothing sends if there's nothing overdue."),
+          digestErr && h("div", { style: { color: "#F5A38C" }, className: "text-[12px] mb-2" }, digestErr),
+          h("button", {
+            onClick: toggleDigest,
+            disabled: digestBusy,
+            style: {
+              background: digestOptIn ? C.surfaceAlt : C.gold,
+              borderColor: C.line,
+              color: digestOptIn ? C.text : "#06223B",
+              opacity: digestBusy ? 0.6 : 1
+            },
+            className: "w-full py-2.5 rounded-xl border text-sm font-bold active:scale-[0.98] transition-transform"
+          }, digestBusy ? "Working\u2026" : (digestOptIn ? "\u2713 On \u2014 tap to turn off" : "Turn on daily digest"))
         )
       ),
  
@@ -2024,3 +2262,4 @@ ReactDOM.createRoot(document.getElementById("root")).render(h(App));
 </script>
 </body>
 </html>
+ 
