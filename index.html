@@ -70,6 +70,11 @@ var ADVISOR_TABLE = "advisors";
 var ADVISOR_ID_COLUMN = "id";          // stable row id shown to the advisor as their identity
 var ADVISOR_NAME_COLUMN = "name";      // display name shown in the picker
 var ADVISOR_ACTIVE_COLUMN = "active";  // matches the real advisors table — hides inactive roster rows from the picker
+// The Dashboard's activity log (entries table) is keyed by advisor CODE,
+// not id — needed so this app can call the same bump_metric() RPC the
+// Dashboard uses, to auto-log New Prospects / Chat Script Usage /
+// Appointments Set. See "DASHBOARD ACTIVITY AUTO-LOG" below.
+var ADVISOR_CODE_COLUMN = "code";
 // Manager-approval gate, shared with the Dashboard. Self-registered rows
 // (either app's "I'm new here" / "Add a teammate") insert as approved:
 // false and stay invisible here — and unable to sign in on any device —
@@ -564,6 +569,7 @@ function rosterSelectColumns() {
   var cols = [ADVISOR_ID_COLUMN, ADVISOR_NAME_COLUMN];
   if (ADVISOR_ACTIVE_COLUMN) cols.push(ADVISOR_ACTIVE_COLUMN);
   if (ADVISOR_APPROVED_COLUMN) cols.push(ADVISOR_APPROVED_COLUMN);
+  if (ADVISOR_CODE_COLUMN) cols.push(ADVISOR_CODE_COLUMN);
   return cols.join(",");
 }
  
@@ -577,9 +583,21 @@ async function fetchRoster() {
     if (res.error) return { error: res.error.message };
     return {
       data: (res.data || []).map(function (row) {
-        return { id: row[ADVISOR_ID_COLUMN], name: row[ADVISOR_NAME_COLUMN] };
+        return { id: row[ADVISOR_ID_COLUMN], name: row[ADVISOR_NAME_COLUMN], code: ADVISOR_CODE_COLUMN ? row[ADVISOR_CODE_COLUMN] : null };
       })
     };
+  } catch (e) { return { error: "Couldn't reach the advisor list." }; }
+}
+ 
+// Backfills `code` onto an advisor identity that was cached locally before
+// this feature shipped (so `br-advisor` in localStorage predates the
+// `code` field). Safe to call any time — a no-op once the code is cached.
+async function fetchAdvisorCode(advisorId) {
+  if (!supabaseClient || !ADVISOR_CODE_COLUMN) return { error: "Cloud isn't configured yet." };
+  try {
+    var res = await supabaseClient.from(ADVISOR_TABLE).select(ADVISOR_CODE_COLUMN).eq(ADVISOR_ID_COLUMN, advisorId).maybeSingle();
+    if (res.error || !res.data) return { error: "Couldn't reach the advisor list." };
+    return { data: res.data[ADVISOR_CODE_COLUMN] || null };
   } catch (e) { return { error: "Couldn't reach the advisor list." }; }
 }
  
@@ -589,11 +607,11 @@ async function fetchRoster() {
 async function checkAdvisorApproval(advisorId) {
   if (!supabaseClient) return { error: "Cloud isn't configured yet." };
   try {
-    var cols = [ADVISOR_ID_COLUMN, ADVISOR_NAME_COLUMN, ADVISOR_APPROVED_COLUMN].join(",");
+    var cols = [ADVISOR_ID_COLUMN, ADVISOR_NAME_COLUMN, ADVISOR_APPROVED_COLUMN].concat(ADVISOR_CODE_COLUMN ? [ADVISOR_CODE_COLUMN] : []).join(",");
     var res = await supabaseClient.from(ADVISOR_TABLE).select(cols).eq(ADVISOR_ID_COLUMN, advisorId).maybeSingle();
     if (res.error || !res.data) return { error: "Couldn't check right now — try again." };
     var approved = res.data[ADVISOR_APPROVED_COLUMN] !== false;
-    return { data: { approved: approved, id: res.data[ADVISOR_ID_COLUMN], name: res.data[ADVISOR_NAME_COLUMN] } };
+    return { data: { approved: approved, id: res.data[ADVISOR_ID_COLUMN], name: res.data[ADVISOR_NAME_COLUMN], code: ADVISOR_CODE_COLUMN ? res.data[ADVISOR_CODE_COLUMN] : null } };
   } catch (e) { return { error: "Couldn't reach the server — try again." }; }
 }
  
@@ -621,6 +639,72 @@ async function addSelfAsAdvisor(name) {
     var r = res.data;
     return { data: { id: r[ADVISOR_ID_COLUMN], name: r[ADVISOR_NAME_COLUMN] } };
   } catch (e) { return { error: "Couldn't add you to the roster." }; }
+}
+ 
+// ======================================================================
+// DASHBOARD ACTIVITY AUTO-LOG — calls the SAME bump_metric() RPC the
+// Dashboard's own tap counters use, so New Prospects (Names List add),
+// Chat Script Usage (each step advanced), and Appointments Set (reaching
+// appt_confirm) show up on the Dashboard without the advisor re-entering
+// anything by hand. Manual dashboard taps and these auto-bumps simply add
+// together — same as if two real events both happened.
+//
+// Requires the advisor's `code` (see ADVISOR_CODE_COLUMN / fetchAdvisorCode
+// above) — an advisor whose code hasn't loaded yet silently skips logging
+// rather than erroring, since code is expected to arrive moments later via
+// the backfill effect.
+//
+// Offline-safe: a failed bump (no signal, RPC hiccup) is queued locally and
+// retried alongside the existing conversation/prospect sync retries — it
+// never blocks navigation and never shows an error to the advisor.
+// ======================================================================
+function phTodayStr() {
+  var d = new Date();
+  function p(n) { return n < 10 ? "0" + n : "" + n; }
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+ 
+var PENDING_BUMPS_KEY = "br-pending-metric-bumps";
+function getPendingBumps() { return lget(PENDING_BUMPS_KEY, []); }
+function setPendingBumps(list) { lset(PENDING_BUMPS_KEY, list); }
+ 
+async function callBumpMetric(entry) {
+  if (!supabaseClient) return false;
+  try {
+    var res = await supabaseClient.rpc("bump_metric", { p_code: entry.code, p_date: entry.date, p_field: entry.field, p_delta: entry.delta });
+    return !res.error;
+  } catch (e) { return false; }
+}
+ 
+// Fire-and-forget from the caller's point of view: tries once immediately,
+// and if that fails, queues for the next flush (on load, on reconnect, and
+// on the same periodic interval the rest of this app already uses).
+async function bumpDashboardMetric(code, field, delta) {
+  if (!code) return; // advisor's code hasn't loaded yet — see fetchAdvisorCode backfill
+  var entry = { code: code, date: phTodayStr(), field: field, delta: delta };
+  var ok = await callBumpMetric(entry);
+  if (!ok) setPendingBumps(getPendingBumps().concat([entry]));
+}
+ 
+var bumpFlushInFlight = false;
+async function flushPendingBumps() {
+  if (bumpFlushInFlight) return;
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+  var pending = getPendingBumps();
+  if (pending.length === 0) return;
+  bumpFlushInFlight = true;
+  try {
+    var stillPending = [];
+    for (var i = 0; i < pending.length; i++) {
+      var ok = await callBumpMetric(pending[i]);
+      if (!ok) stillPending.push(pending[i]);
+    }
+    setPendingBumps(stillPending);
+  } catch (e) {
+    // swallow — same silent-background philosophy as the rest of this app
+  } finally {
+    bumpFlushInFlight = false;
+  }
 }
  
 // ======================================================================
@@ -740,6 +824,7 @@ function toRemoteRow(advisorId, c) {
     convo_id: c.id,
     client_name: c.name,
     current_step: c.step,
+    appt_logged: !!c.apptLogged,
     created_at: c.created ? new Date(c.created).toISOString() : new Date().toISOString(),
     updated_at: c.updated ? new Date(c.updated).toISOString() : new Date().toISOString(),
     deleted_at: null
@@ -764,6 +849,7 @@ function fromRemoteRow(row) {
     id: row.convo_id,
     name: row.client_name || "",
     step: step,
+    apptLogged: !!row.appt_logged,
     created: row.created_at ? Date.parse(row.created_at) : Date.now(),
     updated: row.updated_at ? Date.parse(row.updated_at) : Date.now()
   };
@@ -1167,6 +1253,23 @@ function App() {
   useEffect(function () { lset("br-sort", sortMode); }, [sortMode]);
   useEffect(function () { lset("br-names-sort", namesSortMode); }, [namesSortMode]);
  
+  // Backfills `code` onto an advisor identity cached on this device before
+  // this feature shipped — needed to call the Dashboard's bump_metric()
+  // RPC for the activity auto-log below. No-ops once code is already
+  // cached, and silently does nothing if the fetch fails (auto-logging
+  // just stays off for this advisor until it succeeds on a later load).
+  useEffect(function () {
+    if (!advisor || advisor.code) return;
+    var cancelled = false;
+    fetchAdvisorCode(advisor.id).then(function (res) {
+      if (cancelled || !res.data) return;
+      var updated = Object.assign({}, advisor, { code: res.data });
+      setAdvisor(updated);
+      lset("br-advisor", updated);
+    });
+    return function () { cancelled = true; };
+  }, [advisor && advisor.id, advisor && advisor.code]);
+ 
   // Local save is unconditional and instant on every change — sync is a
   // background concern layered on top, never a precondition for saving.
   useEffect(function () {
@@ -1212,6 +1315,17 @@ function App() {
     var iv = setInterval(function () { runProspectSync(advisor.id).then(refreshProspectSyncMeta); }, 25000);
     return function () { window.removeEventListener("online", onOnline); clearInterval(iv); };
     // eslint-disable-next-line
+  }, [advisor && advisor.id]);
+ 
+  // Retries any Dashboard activity bumps (New Prospects / Chat Script Usage
+  // / Appointments Set) that couldn't reach the server the first time —
+  // same silent, best-effort pattern as conversation and prospect sync.
+  useEffect(function () {
+    if (!advisor) return;
+    flushPendingBumps();
+    window.addEventListener("online", flushPendingBumps);
+    var iv = setInterval(flushPendingBumps, 25000);
+    return function () { window.removeEventListener("online", flushPendingBumps); clearInterval(iv); };
   }, [advisor && advisor.id]);
  
   // Offer a one-tap restore exactly once per advisor, only when this
@@ -1285,12 +1399,28 @@ function App() {
   function goTo(stepKey) {
     if (stepKey === "home") { setActiveId(null); return; }
     var changedId = null;
+    var justConfirmedAppt = false;
     setConvos(convos.map(function (c) {
       if (c.id !== activeId) return c;
       changedId = c.id;
-      return Object.assign({}, c, { step: stepKey, updated: Date.now() });
+      // Guarded by the conversation's own apptLogged flag (synced across
+      // devices via conversation_backups), not by comparing old/new step —
+      // so revisiting or restarting a conversation can never double-bump
+      // Appointments Set once it's been logged.
+      if (stepKey === "appt_confirm" && !c.apptLogged) justConfirmedAppt = true;
+      return Object.assign({}, c, { step: stepKey, updated: Date.now(), apptLogged: c.apptLogged || justConfirmedAppt });
     }));
-    if (changedId) { markDirty(advisor.id, changedId); refreshSyncMeta(); }
+    if (changedId) {
+      markDirty(advisor.id, changedId);
+      refreshSyncMeta();
+      // Chat Script Usage: every genuine step advance, no cap, no
+      // dedupe — this is meant to reflect actual script engagement.
+      bumpDashboardMetric(advisor.code, "approaching", 1);
+      if (justConfirmedAppt) {
+        bumpDashboardMetric(advisor.code, "appts", 1);
+        flash("Logged to your Dashboard \u2014 Appointments Set +1");
+      }
+    }
   }
  
   // Copying a line means it got sent — on the "chase" steps the advisor
@@ -1328,6 +1458,7 @@ function App() {
     refreshProspectSyncMeta();
     setQuickAddOpen(false);
     flash(dupe ? "Added \u2014 similar name already on your list" : "Added to your names list");
+    bumpDashboardMetric(advisor.code, "prospecting", 1);
   }
  
   // Promoting is just starting a normal conversation at step "start" —
@@ -2130,6 +2261,10 @@ function IdentityScreen(props) {
 function PendingApprovalScreen(props) {
   var pending = props.pending, onCheck = props.onCheck, onVerifyPin = props.onVerifyPin, onDone = props.onDone, onCancel = props.onCancel;
   var approvedState = useState(false); var approved = approvedState[0], setApproved = approvedState[1];
+  // Holds the freshly-fetched record once approved — carries `code`, which
+  // the original self-signup never had (Script Tool's self-signup only
+  // ever collects a name).
+  var resolvedState = useState(pending); var resolved = resolvedState[0], setResolved = resolvedState[1];
   var checkingState = useState(false); var checking = checkingState[0], setChecking = checkingState[1];
   var checkMsgState = useState(""); var checkMsg = checkMsgState[0], setCheckMsg = checkMsgState[1];
   var pinState = useState(""); var pin = pinState[0], setPin = pinState[1];
@@ -2141,7 +2276,7 @@ function PendingApprovalScreen(props) {
     var res = await onCheck();
     setChecking(false);
     if (res.error) { setCheckMsg(res.error); return; }
-    if (res.data && res.data.approved) { setApproved(true); return; }
+    if (res.data && res.data.approved) { setResolved(res.data); setApproved(true); return; }
     setCheckMsg("Still waiting \u2014 check back later.");
   };
  
@@ -2149,10 +2284,10 @@ function PendingApprovalScreen(props) {
     if (pinBusy) return;
     if (pin.trim().length < 4) { setPinErr("PIN must be at least 4 digits."); return; }
     setPinErr(null); setPinBusy(true);
-    onVerifyPin(pending.id, pin.trim()).then(function (res) {
+    onVerifyPin(resolved.id, pin.trim()).then(function (res) {
       setPinBusy(false);
       if (res.error) { setPinErr(res.error); setPin(""); return; }
-      onDone({ id: pending.id, name: pending.name });
+      onDone({ id: resolved.id, name: resolved.name, code: resolved.code });
     });
   };
  
