@@ -975,16 +975,53 @@ function todayStamp() {
   return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
 }
  
-function downloadBlob(filename, mime, content) {
-  var blob = new Blob([content], { type: mime });
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+// Returns true/false rather than throwing, so callers can toast the
+// advisor a real result instead of assuming the export always worked.
+//
+// On an iOS "Add to Home Screen" install specifically, a plain
+// <a download> click often has nothing to hand the file to — there's no
+// browser chrome, no Downloads folder, so the blob just opens as a wall of
+// raw text in the same window. That's almost certainly what "copy from a
+// textarea" actually was: not literal <textarea> code, but the CSV
+// landing on-screen as text instead of becoming a file. The fix is to
+// offer the file to the OS share sheet first (Save to Files, AirDrop,
+// Messenger, email, etc.) wherever that API exists, and only fall back to
+// the classic anchor-click download where it doesn't (desktop browsers,
+// most Android WebViews).
+async function downloadBlob(filename, mime, content) {
+  var blob;
+  try { blob = new Blob([content], { type: mime }); } catch (e) { return false; }
+ 
+  if (navigator.share && navigator.canShare) {
+    try {
+      var file = new File([blob], filename, { type: mime });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file] });
+        return true;
+      }
+    } catch (e) {
+      // AbortError means the advisor deliberately closed the share sheet —
+      // respect that instead of immediately firing a second, unrequested
+      // download right after they cancelled the first one.
+      if (e && e.name === "AbortError") return false;
+      // Any other failure (canShare lied, share() itself broke) falls
+      // through to the classic download below.
+    }
+  }
+ 
+  try {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    return true;
+  } catch (e2) {
+    return false;
+  }
 }
  
 function exportJSON(advisor, convos, prospects) {
@@ -995,7 +1032,7 @@ function exportJSON(advisor, convos, prospects) {
     conversations: convos,
     prospects: prospects || []
   };
-  downloadBlob(
+  return downloadBlob(
     "battle-river-script-backup-" + slugify(advisor && advisor.name) + "-" + todayStamp() + ".json",
     "application/json",
     JSON.stringify(payload, null, 2)
@@ -1019,7 +1056,7 @@ function exportCSV(advisor, convos) {
     ]);
   });
   var csv = rows.map(function (r) { return r.map(csvEscape).join(","); }).join("\n");
-  downloadBlob(
+  return downloadBlob(
     "battle-river-script-backup-" + slugify(advisor && advisor.name) + "-" + todayStamp() + ".csv",
     "text/csv",
     csv
@@ -1050,6 +1087,42 @@ async function fetchCloudProspects(advisorId) {
     if (res.error) return { data: [], error: res.error.message };
     return { data: res.data || [] };
   } catch (e) { return { data: [], error: "Couldn't reach the backup." }; }
+}
+ 
+// Same query, minus the deleted_at filter — needed by the background pull
+// below, which has to see tombstoned rows too (that's how it knows a name
+// deleted on one phone should disappear on the other, not just which
+// names to add).
+async function fetchAllCloudProspects(advisorId) {
+  if (!supabaseClient) return { data: [] };
+  try {
+    var res = await supabaseClient.from(PROSPECTS_TABLE).select("*").eq("advisor_id", advisorId);
+    if (res.error) return { data: [], error: res.error.message };
+    return { data: res.data || [] };
+  } catch (e) { return { data: [], error: "Couldn't reach the backup." }; }
+}
+ 
+// Pure merge, no side effects, so it's easy to reason about (and unit
+// test) on its own. This is what makes Names List sync actually
+// bidirectional instead of "push only, pull once when empty":
+//   - a cloud row not seen locally yet gets added (another device's add)
+//   - a cloud row with deleted_at set gets removed locally if present
+//     (another device's delete)
+//   - anything local that the cloud doesn't know about yet is left
+//     untouched — it just hasn't pushed yet, this function never guesses
+//     that "cloud doesn't have it" means "delete it"
+function mergeProspectsFromCloud(localList, cloudRows) {
+  var map = {};
+  localList.forEach(function (p) { map[p.id] = p; });
+  cloudRows.forEach(function (row) {
+    var id = row.prospect_id;
+    if (row.deleted_at) {
+      delete map[id];
+    } else if (!map[id]) {
+      map[id] = fromProspectRemoteRow(row);
+    }
+  });
+  return Object.keys(map).map(function (k) { return map[k]; });
 }
  
 function toProspectRemoteRow(advisorId, p) {
@@ -1182,7 +1255,7 @@ function exportProspectsCSV(advisor, prospects) {
     ]);
   });
   var csv = rows.map(function (r) { return r.map(csvEscape).join(","); }).join("\n");
-  downloadBlob(
+  return downloadBlob(
     "battle-river-names-list-" + slugify(advisor && advisor.name) + "-" + todayStamp() + ".csv",
     "text/csv",
     csv
@@ -1312,15 +1385,34 @@ function App() {
     // eslint-disable-next-line
   }, [advisor && advisor.id]);
  
+  // Pulls any names added/deleted on OTHER devices into this device's list.
+  // Before this, the only way cloud names ever reached a second phone was
+  // the one-time "your list is empty, restore?" offer below — which never
+  // fires again once this device has any name of its own. Two phones used
+  // day-to-day would each keep pushing to the cloud but never actually
+  // catch up on what the other one added. This runs on the same schedule
+  // as the push sync just below, so both directions stay current together.
+  // Uses the functional form of setProspects so it always merges against
+  // the latest state, never a stale closure from when the interval/effect
+  // was set up.
+  function pullProspects() {
+    if (!advisor || !supabaseClient) return;
+    fetchAllCloudProspects(advisor.id).then(function (res) {
+      if (res.error || !res.data || res.data.length === 0) return;
+      setProspects(function (prev) { return mergeProspectsFromCloud(prev, res.data); });
+    });
+  }
+ 
   // Same background-sync pattern, running independently for prospects so
   // a slow/failed conversation sync never blocks a prospect from backing
   // up (or vice versa).
   useEffect(function () {
     if (!advisor) return;
+    pullProspects();
     runProspectSync(advisor.id).then(refreshProspectSyncMeta);
-    function onOnline() { runProspectSync(advisor.id).then(refreshProspectSyncMeta); }
+    function onOnline() { pullProspects(); runProspectSync(advisor.id).then(refreshProspectSyncMeta); }
     window.addEventListener("online", onOnline);
-    var iv = setInterval(function () { runProspectSync(advisor.id).then(refreshProspectSyncMeta); }, 25000);
+    var iv = setInterval(function () { pullProspects(); runProspectSync(advisor.id).then(refreshProspectSyncMeta); }, 25000);
     return function () { window.removeEventListener("online", onOnline); clearInterval(iv); };
     // eslint-disable-next-line
   }, [advisor && advisor.id]);
@@ -1379,8 +1471,18 @@ function App() {
   function handleAdvisorSelected(sel) {
     lset("br-advisor", sel);
     setAdvisor(sel);
+    if (!lget("br-onboarding-seen-" + sel.id, false)) {
+      setScreen("onboarding");
+    } else {
+      setScreen("home");
+      flash("Signed in as " + sel.name);
+    }
+  }
+ 
+  function finishOnboarding() {
+    if (advisor) lset("br-onboarding-seen-" + advisor.id, true);
     setScreen("home");
-    flash("Signed in as " + sel.name);
+    flash("Signed in as " + (advisor ? advisor.name : ""));
   }
  
   // Adding a teammate to the roster from an already-signed-in device must
@@ -1659,6 +1761,12 @@ function App() {
     );
   }
  
+  if (screen === "onboarding") {
+    return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
+      h(OnboardingScreen, { onFinish: finishOnboarding })
+    );
+  }
+ 
   if (screen === "settings") {
     return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
       h(SettingsScreen, {
@@ -1669,7 +1777,9 @@ function App() {
         onSyncNow: syncNow,
         onCheckRestore: checkRestoreManually,
         onSyncProspectsNow: syncProspectsNow,
-        onCheckProspectRestore: checkProspectRestoreManually
+        onCheckProspectRestore: checkProspectRestoreManually,
+        onFlash: flash,
+        onShowTour: function () { setScreen("onboarding"); }
       }),
       toastEl, undoBannerEl, fabEl, quickAddSheetEl
     );
@@ -2435,6 +2545,79 @@ function ActivityLogStatusCard(props) {
   );
 }
  
+// First-run tour: 3 short screens shown once, right after a brand-new
+// advisor identity finishes signing in (see handleAdvisorSelected). The
+// note on the `start` step was previously the only guidance in the whole
+// app — this exists to cut early drop-off before an advisor ever reaches
+// that note. Skippable at every step, and re-openable later from Settings
+// ("Show quick tour again") for anyone who wants a refresher.
+function OnboardingScreen(props) {
+  var stepState = useState(0); var step = stepState[0], setStep = stepState[1];
+ 
+  var slides = [
+    {
+      icon: "\uD83D\uDCCB",
+      title: "Copy the line, send it, done",
+      body: "Bawat step may ready-made na message. I-tap ang \u201CCopy\u201D, i-paste sa Messenger, tapos piliin kung ano ang sinagot ni client \u2014 dun ka na dadalhin ng script sa susunod na tamang linya."
+    },
+    {
+      icon: "\u23F0",
+      title: "Hindi na malilimutan ang follow-up",
+      body: "Grey \u2014 bago lang. Gold \u2014 3 days na walang chat. Red \u2014 7+ days na, dapat i-chat na ulit. I-sort by \u201CNeeds follow-up\u201D para makita agad kung sino ang unahin."
+    },
+    {
+      icon: "\uD83D\uDCD2",
+      title: "I-jot down kahit hindi pa sigurado",
+      body: "Tap the gold + button anytime to save a name to your Names List \u2014 kahit hindi pa ready for the full script. Awtomatiko itong nagba-backup sa cloud, kaya kahit magpalit ka ng phone, andun pa rin ang listahan mo."
+    }
+  ];
+ 
+  var s = slides[step];
+  var isLast = step === slides.length - 1;
+ 
+  return h("div", {
+    className: "max-w-md mx-auto px-5 pt-10 pb-10 flex flex-col",
+    style: { minHeight: "100vh", paddingTop: "calc(2.5rem + env(safe-area-inset-top))", paddingBottom: "calc(2.5rem + env(safe-area-inset-bottom))" }
+  },
+    h("div", { className: "flex items-center justify-between mb-10" },
+      h(Shield, { size: 40, uid: "onboarding" }),
+      h("button", {
+        onClick: props.onFinish,
+        style: { color: C.muted },
+        className: "text-sm font-mono active:opacity-60"
+      }, "Skip")
+    ),
+ 
+    h("div", { className: "flex-1 flex flex-col items-center justify-center text-center px-2" },
+      h("div", { className: "text-6xl mb-6" }, s.icon),
+      h("div", { className: "font-display text-2xl leading-tight mb-4" }, s.title),
+      h("div", { style: { color: C.muted }, className: "text-[14px] leading-relaxed max-w-xs" }, s.body)
+    ),
+ 
+    h("div", { className: "flex items-center justify-center gap-2 mb-6" },
+      slides.map(function (_, i) {
+        return h("div", {
+          key: i,
+          style: { background: i === step ? C.gold : C.line, width: i === step ? "20px" : "7px" },
+          className: "h-[7px] rounded-full transition-all"
+        });
+      })
+    ),
+ 
+    h("button", {
+      onClick: function () { if (isLast) props.onFinish(); else setStep(step + 1); },
+      style: { background: C.gold, color: "#06223B" },
+      className: "w-full py-3.5 rounded-xl font-bold active:scale-[0.98] transition-transform"
+    }, isLast ? "Get started" : "Next"),
+ 
+    step > 0 && h("button", {
+      onClick: function () { setStep(step - 1); },
+      style: { color: C.muted },
+      className: "w-full mt-3 py-2 text-sm font-mono active:opacity-60"
+    }, "back")
+  );
+}
+ 
 function SettingsScreen(props) {
   var advisor = props.advisor, convos = props.convos, meta = props.syncMeta;
  
@@ -2488,7 +2671,12 @@ function SettingsScreen(props) {
           onClick: props.onChangeIdentity,
           style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
           className: "w-full py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
-        }, "Change identity")
+        }, "Change identity"),
+        h("button", {
+          onClick: props.onShowTour,
+          style: { color: C.muted },
+          className: "w-full mt-2 py-1 text-[13px] font-mono active:opacity-60"
+        }, "Show quick tour again")
       ),
  
       h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" }, "Cloud backup \u2014 conversations"),
@@ -2552,18 +2740,30 @@ function SettingsScreen(props) {
         h("div", { style: { color: C.muted }, className: "text-[12px] mb-3" }, "A personal copy of everything on this device — not a substitute for the cloud backup above."),
         h("div", { className: "flex gap-2 mb-2" },
           h("button", {
-            onClick: function () { exportJSON(advisor, convos, props.prospects); },
+            onClick: function () {
+              exportJSON(advisor, convos, props.prospects).then(function (ok) {
+                if (props.onFlash) props.onFlash(ok ? "Exported \u2014 check your Files/Downloads or share sheet" : "Couldn't export \u2014 try again");
+              });
+            },
             style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
             className: "flex-1 py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
           }, "Export JSON (everything)"),
           h("button", {
-            onClick: function () { exportCSV(advisor, convos); },
+            onClick: function () {
+              exportCSV(advisor, convos).then(function (ok) {
+                if (props.onFlash) props.onFlash(ok ? "Exported \u2014 check your Files/Downloads or share sheet" : "Couldn't export \u2014 try again");
+              });
+            },
             style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
             className: "flex-1 py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
           }, "Export conversations CSV")
         ),
         h("button", {
-          onClick: function () { exportProspectsCSV(advisor, props.prospects); },
+          onClick: function () {
+            exportProspectsCSV(advisor, props.prospects).then(function (ok) {
+              if (props.onFlash) props.onFlash(ok ? "Exported \u2014 check your Files/Downloads or share sheet" : "Couldn't export \u2014 try again");
+            });
+          },
           style: { background: C.surfaceAlt, borderColor: C.line, color: C.text },
           className: "w-full py-2.5 rounded-xl border text-sm font-semibold active:scale-[0.98] transition-transform"
         }, "Export names list CSV")
