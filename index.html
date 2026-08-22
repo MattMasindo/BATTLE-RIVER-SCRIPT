@@ -65,11 +65,16 @@ var SUPABASE_URL = "https://chymjohbkwopbcdssfoo.supabase.co";
 var SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNoeW1qb2hia3dvcGJjZHNzZm9vIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY4ODgzMTksImV4cCI6MjEwMjQ2NDMxOX0.wzQsGd-ohaFxz9vknvRUvWXVYnUKGZOLWSumOf2_Da8";
  
 // --- Advisor roster: confirmed against the real table (id, name, code,
-// created_at, active). ---
+// created_at, active, approved). ---
 var ADVISOR_TABLE = "advisors";
 var ADVISOR_ID_COLUMN = "id";          // stable row id shown to the advisor as their identity
 var ADVISOR_NAME_COLUMN = "name";      // display name shown in the picker
 var ADVISOR_ACTIVE_COLUMN = "active";  // matches the real advisors table — hides inactive roster rows from the picker
+// Manager-approval gate, shared with the Dashboard. Self-registered rows
+// (either app's "I'm new here" / "Add a teammate") insert as approved:
+// false and stay invisible here — and unable to sign in on any device —
+// until the manager approves them from the Dashboard's Manager tab.
+var ADVISOR_APPROVED_COLUMN = "approved";
  
 // --- Conversation backup table: created by the Patch 1 migration. ---
 var CONVERSATIONS_TABLE = "conversation_backups";
@@ -90,7 +95,7 @@ function isOneSignalConfigured() {
   return ONESIGNAL_APP_ID.indexOf("YOUR-ONESIGNAL") === -1;
 }
  
-var APP_VERSION = "1.3.5-sw-scope-fix";
+var APP_VERSION = "1.3.4-onesignal-configured";
  
 function isSupabaseConfigured() {
   return SUPABASE_URL.indexOf("YOUR-PROJECT") === -1 && SUPABASE_ANON_KEY.indexOf("YOUR-ANON") === -1;
@@ -518,6 +523,7 @@ function syncMetaKey(advisorId) { return "br-sync-meta-" + advisorId; }
 function rosterSelectColumns() {
   var cols = [ADVISOR_ID_COLUMN, ADVISOR_NAME_COLUMN];
   if (ADVISOR_ACTIVE_COLUMN) cols.push(ADVISOR_ACTIVE_COLUMN);
+  if (ADVISOR_APPROVED_COLUMN) cols.push(ADVISOR_APPROVED_COLUMN);
   return cols.join(",");
 }
  
@@ -526,6 +532,7 @@ async function fetchRoster() {
   try {
     var q = supabaseClient.from(ADVISOR_TABLE).select(rosterSelectColumns()).order(ADVISOR_NAME_COLUMN, { ascending: true });
     if (ADVISOR_ACTIVE_COLUMN) q = q.eq(ADVISOR_ACTIVE_COLUMN, true);
+    if (ADVISOR_APPROVED_COLUMN) q = q.eq(ADVISOR_APPROVED_COLUMN, true);
     var res = await q;
     if (res.error) return { error: res.error.message };
     return {
@@ -536,14 +543,30 @@ async function fetchRoster() {
   } catch (e) { return { error: "Couldn't reach the advisor list." }; }
 }
  
-// Self-service "I'm new here" roster signup. Requires an anon INSERT policy
-// on ADVISOR_TABLE that does not exist by default (see the migration note)
-// — until that policy is granted, this fails with a normal, non-crashing
-// error message rather than doing anything silently. Only ever sets the
-// columns this app already knows about (name, and active if configured);
-// id and any other column on your real table (e.g. the "code" column) are
-// left to the database's own defaults, since this app has no way to know
-// what value those should hold.
+// Checks a single advisor's current approval status by id. Used to
+// re-check a pending self-signup without re-fetching (and re-filtering)
+// the whole roster.
+async function checkAdvisorApproval(advisorId) {
+  if (!supabaseClient) return { error: "Cloud isn't configured yet." };
+  try {
+    var cols = [ADVISOR_ID_COLUMN, ADVISOR_NAME_COLUMN, ADVISOR_APPROVED_COLUMN].join(",");
+    var res = await supabaseClient.from(ADVISOR_TABLE).select(cols).eq(ADVISOR_ID_COLUMN, advisorId).maybeSingle();
+    if (res.error || !res.data) return { error: "Couldn't check right now — try again." };
+    var approved = res.data[ADVISOR_APPROVED_COLUMN] !== false;
+    return { data: { approved: approved, id: res.data[ADVISOR_ID_COLUMN], name: res.data[ADVISOR_NAME_COLUMN] } };
+  } catch (e) { return { error: "Couldn't reach the server — try again." }; }
+}
+ 
+// Self-service "I'm new here" / "Add a teammate" roster signup. Requires an
+// anon INSERT policy on ADVISOR_TABLE that does not exist by default (see
+// the migration note) — until that policy is granted, this fails with a
+// normal, non-crashing error message rather than doing anything silently.
+// Always inserts approved: false — a manager has to approve the row from
+// the Dashboard's Manager tab before it appears in anyone's roster/picker
+// or can be signed into. Any other column on your real table (e.g. the
+// "code" column) is left to the database's own defaults/nulls, since this
+// app has no way to know what value those should hold — the manager fills
+// code in when they approve.
 async function addSelfAsAdvisor(name) {
   if (!supabaseClient) return { error: "Cloud isn't configured yet." };
   var nm = name.trim();
@@ -552,6 +575,7 @@ async function addSelfAsAdvisor(name) {
     var row = {};
     row[ADVISOR_NAME_COLUMN] = nm;
     if (ADVISOR_ACTIVE_COLUMN) row[ADVISOR_ACTIVE_COLUMN] = true;
+    if (ADVISOR_APPROVED_COLUMN) row[ADVISOR_APPROVED_COLUMN] = false;
     var res = await supabaseClient.from(ADVISOR_TABLE).insert(row).select(rosterSelectColumns()).single();
     if (res.error) return { error: res.error.message };
     var r = res.data;
@@ -589,20 +613,7 @@ function initOneSignal() {
   if (!isOneSignalConfigured()) return;
   window.OneSignalDeferred = window.OneSignalDeferred || [];
   window.OneSignalDeferred.push(function (OneSignal) {
-    // GitHub Pages project sites (like this one) serve from a subdirectory,
-    // e.g. https://mattmasindo.github.io/BATTLE-RIVER-SCRIPT/ \u2014 not the
-    // domain root. OneSignal's default init() assumes the service worker
-    // lives at the domain root (/OneSignalSDKWorker.js) unless told
-    // otherwise, so without this the subscription silently never completes,
-    // even though the browser's own notification permission is granted.
-    // Computed from the current path (rather than hardcoded) so this keeps
-    // working correctly even if the repo is ever renamed or moved.
-    var scope = location.pathname.substring(0, location.pathname.lastIndexOf("/") + 1) || "/";
-    OneSignal.init({
-      appId: ONESIGNAL_APP_ID,
-      serviceWorkerPath: "OneSignalSDKWorker.js",
-      serviceWorkerParam: { scope: scope }
-    });
+    OneSignal.init({ appId: ONESIGNAL_APP_ID });
   });
 }
  
@@ -1051,6 +1062,11 @@ function exportProspectsCSV(advisor, prospects) {
  
 function App() {
   var advisorState = useState(lget("br-advisor", null)); var advisor = advisorState[0], setAdvisor = advisorState[1];
+  // A self-registered ("I'm new here") advisor waiting on manager approval.
+  // Kept separate from `advisor` on purpose — this device knows who they
+  // claim to be, but they can't sign in (no PIN step) until approved.
+  var pendingAdvisorState = useState(lget("br-pending-advisor", null)); var pendingAdvisor = pendingAdvisorState[0], setPendingAdvisorState = pendingAdvisorState[1];
+  function setPendingAdvisor(p) { setPendingAdvisorState(p); lset("br-pending-advisor", p); }
   var screenState = useState("home"); var screen = screenState[0], setScreen = screenState[1]; // "home" | "settings" | "identity"
   var convosState = useState([]); var convos = convosState[0], setConvos = convosState[1];
   var activeState = useState(null); var activeId = activeState[0], setActiveId = activeState[1];
@@ -1399,12 +1415,26 @@ function App() {
     onClose: function () { setQuickAddOpen(false); }
   }) : null;
  
+  if (pendingAdvisor) {
+    return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
+      h(PendingApprovalScreen, {
+        pending: pendingAdvisor,
+        onCheck: function () { return checkAdvisorApproval(pendingAdvisor.id); },
+        onVerifyPin: verifyAdvisorPin,
+        onDone: function (identity) { setPendingAdvisor(null); handleAdvisorSelected(identity); },
+        onCancel: function () { setPendingAdvisor(null); }
+      }),
+      toastEl
+    );
+  }
+ 
   if (!advisor || screen === "identity") {
     return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
       h(IdentityScreen, {
         mode: advisor ? "change" : "first-run",
         currentName: advisor && advisor.name,
         onSelect: handleAdvisorSelected,
+        onPendingRegistration: setPendingAdvisor,
         onCancel: advisor ? function () { setScreen("settings"); } : null
       }),
       toastEl
@@ -1867,9 +1897,12 @@ function IdentityScreen(props) {
       // Adding a teammate from an already-signed-in device (add-advisor
       // mode) never claims that identity on this device, so it skips the
       // PIN step entirely \u2014 the real teammate sets their own PIN the
-      // first time they pick their own name.
+      // first time they pick their own name, once a manager has approved
+      // them.
       if (props.mode === "add-advisor") { props.onAdded(res.data); return; }
-      openPinFor(res.data);
+      // Not approved yet \u2014 hand off to the parent's waiting screen
+      // instead of opening the PIN step immediately.
+      props.onPendingRegistration(res.data);
     });
   }
  
@@ -1910,7 +1943,7 @@ function IdentityScreen(props) {
       "Pick your name once. This just attributes your conversations and backs them up under the right advisor — there's no password."),
  
     props.mode === "add-advisor" && h("div", { style: { color: C.muted }, className: "text-[13px] leading-relaxed mb-6" },
-      "Add a teammate to the shared roster. This only adds them to the list — it won't change who's signed in on this device."),
+      "Add a teammate to the shared roster. A manager needs to approve them from the Dashboard before they show up here or can sign in — this only submits the request, it won't change who's signed in on this device."),
  
     props.mode === "change" && h("div", {
       style: { background: C.surfaceAlt, borderColor: C.goldDim, color: C.goldSoft },
@@ -1952,14 +1985,16 @@ function IdentityScreen(props) {
         onClick: function () { setNewAdvisorOpen(true); },
         style: { color: C.gold },
         className: "w-full py-3 text-sm font-semibold active:opacity-60 mb-2"
-      }, "I'm new here \u2014 add my name"),
+      }, "I'm new here \u2014 request access"),
  
       newAdvisorOpen && h("div", {
         style: { background: C.surfaceAlt, borderColor: C.line },
         className: "rounded-xl border p-4 mb-4"
       },
         h("div", { style: { color: C.muted }, className: "text-[12px] leading-relaxed mb-3" },
-          "Adds your name to the shared advisor list so any device can back your conversations up under you."),
+          props.mode === "add-advisor"
+            ? "Submits a request to add this name to the shared advisor list. A manager needs to approve it before it shows up anywhere."
+            : "Submits a request to join the shared advisor list. A manager needs to approve you before you can sign in and set your PIN."),
         newAdvisorErr && h("div", { style: { color: "#F5A38C" }, className: "text-[12px] mb-2" }, newAdvisorErr),
         h("input", {
           autoFocus: true,
@@ -1976,7 +2011,7 @@ function IdentityScreen(props) {
             disabled: newAdvisorBusy,
             style: { background: C.gold, color: "#06223B", opacity: newAdvisorBusy ? 0.6 : 1 },
             className: "flex-1 py-2.5 rounded-xl text-sm font-bold active:scale-[0.98] transition-transform"
-          }, newAdvisorBusy ? "Adding\u2026" : "Add me"),
+          }, newAdvisorBusy ? "Submitting\u2026" : (props.mode === "add-advisor" ? "Submit teammate" : "Request access")),
           h("button", {
             onClick: function () {
               if (props.mode === "add-advisor" && props.onCancel) { props.onCancel(); return; }
@@ -2034,6 +2069,94 @@ function IdentityScreen(props) {
       style: { color: C.muted },
       className: "w-full mt-2 py-3 text-sm font-mono active:opacity-60"
     }, "cancel")
+  );
+}
+ 
+// Shown instead of the normal identity screen while this device has a
+// self-registered advisor waiting on manager approval. Two internal
+// states: waiting (manual "Check again" — no polling, same pattern as
+// Sync now / Restore from cloud elsewhere in this app) and claim-pin
+// (approved — set/verify the shared PIN, same verify_advisor_pin() flow
+// used everywhere else).
+function PendingApprovalScreen(props) {
+  var pending = props.pending, onCheck = props.onCheck, onVerifyPin = props.onVerifyPin, onDone = props.onDone, onCancel = props.onCancel;
+  var approvedState = useState(false); var approved = approvedState[0], setApproved = approvedState[1];
+  var checkingState = useState(false); var checking = checkingState[0], setChecking = checkingState[1];
+  var checkMsgState = useState(""); var checkMsg = checkMsgState[0], setCheckMsg = checkMsgState[1];
+  var pinState = useState(""); var pin = pinState[0], setPin = pinState[1];
+  var pinBusyState = useState(false); var pinBusy = pinBusyState[0], setPinBusy = pinBusyState[1];
+  var pinErrState = useState(""); var pinErr = pinErrState[0], setPinErr = pinErrState[1];
+ 
+  var check = async function () {
+    setChecking(true); setCheckMsg(null);
+    var res = await onCheck();
+    setChecking(false);
+    if (res.error) { setCheckMsg(res.error); return; }
+    if (res.data && res.data.approved) { setApproved(true); return; }
+    setCheckMsg("Still waiting \u2014 check back later.");
+  };
+ 
+  var submitPin = function () {
+    if (pinBusy) return;
+    if (pin.trim().length < 4) { setPinErr("PIN must be at least 4 digits."); return; }
+    setPinErr(null); setPinBusy(true);
+    onVerifyPin(pending.id, pin.trim()).then(function (res) {
+      setPinBusy(false);
+      if (res.error) { setPinErr(res.error); setPin(""); return; }
+      onDone({ id: pending.id, name: pending.name });
+    });
+  };
+ 
+  if (approved) {
+    return h("div", { className: "max-w-md mx-auto px-5 pt-10 pb-16" },
+      h("div", { className: "flex items-center gap-3.5 mb-8" },
+        h(Shield, { size: 44, uid: "claim" }),
+        h("div", null,
+          h("div", { style: { color: C.good }, className: "text-[10px] tracking-[0.28em] uppercase font-mono mb-0.5" }, "Approved"),
+          h("div", { className: "font-display text-[22px] leading-tight" }, pending.name)
+        )
+      ),
+      h("div", { style: { color: C.muted }, className: "text-[13px] leading-relaxed mb-6" },
+        "Set your PIN now \u2014 whatever you type becomes your PIN going forward."),
+      pinErr && h("div", { style: { color: "#F5A38C" }, className: "text-[13px] mb-3" }, pinErr),
+      h("input", {
+        autoFocus: true, type: "password", inputMode: "numeric", pattern: "[0-9]*", maxLength: 6,
+        value: pin,
+        onChange: function (ev) { setPin(ev.target.value.replace(/[^0-9]/g, "")); },
+        onKeyDown: function (ev) { if (ev.key === "Enter") submitPin(); },
+        placeholder: "4\u20136 digit PIN",
+        style: { background: C.bg, borderColor: C.line, color: C.text, letterSpacing: "0.3em" },
+        className: "w-full px-4 py-3 rounded-xl border outline-none text-lg text-center mb-4"
+      }),
+      h("button", {
+        onClick: submitPin, disabled: pinBusy,
+        style: { background: C.gold, color: "#06223B", opacity: pinBusy ? 0.6 : 1 },
+        className: "w-full py-3.5 rounded-xl font-bold active:scale-[0.98] transition-transform"
+      }, pinBusy ? "Checking\u2026" : "Continue")
+    );
+  }
+ 
+  return h("div", { className: "max-w-md mx-auto px-5 pt-10 pb-16" },
+    h("div", { className: "flex items-center gap-3.5 mb-8" },
+      h(Shield, { size: 44, uid: "wait" }),
+      h("div", null,
+        h("div", { style: { color: C.gold }, className: "text-[10px] tracking-[0.28em] uppercase font-mono mb-0.5" }, "Waiting for approval"),
+        h("div", { className: "font-display text-[22px] leading-tight" }, pending.name)
+      )
+    ),
+    h("div", { style: { color: C.muted }, className: "text-[13px] leading-relaxed mb-6" },
+      "Your manager needs to approve this account before you can sign in and set your PIN."),
+    checkMsg && h("div", { style: { color: C.muted }, className: "text-[12px] mb-3" }, checkMsg),
+    h("button", {
+      onClick: check, disabled: checking,
+      style: { background: C.gold, color: "#06223B", opacity: checking ? 0.6 : 1 },
+      className: "w-full py-3.5 rounded-xl font-bold active:scale-[0.98] transition-transform"
+    }, checking ? "Checking\u2026" : "Check again"),
+    h("button", {
+      onClick: onCancel,
+      style: { color: C.muted },
+      className: "w-full mt-4 py-3 text-sm font-mono active:opacity-60"
+    }, "Not me \u2014 cancel")
   );
 }
  
@@ -2294,3 +2417,5 @@ ReactDOM.createRoot(document.getElementById("root")).render(h(App));
 </body>
 </html>
  
+ 
+COPY ABOVE THIS LINE
