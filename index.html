@@ -90,7 +90,7 @@ function isOneSignalConfigured() {
   return ONESIGNAL_APP_ID.indexOf("YOUR-ONESIGNAL") === -1;
 }
  
-var APP_VERSION = "1.3.4-onesignal-configured";
+var APP_VERSION = "1.3.5-sw-scope-fix";
  
 function isSupabaseConfigured() {
   return SUPABASE_URL.indexOf("YOUR-PROJECT") === -1 && SUPABASE_ANON_KEY.indexOf("YOUR-ANON") === -1;
@@ -589,7 +589,20 @@ function initOneSignal() {
   if (!isOneSignalConfigured()) return;
   window.OneSignalDeferred = window.OneSignalDeferred || [];
   window.OneSignalDeferred.push(function (OneSignal) {
-    OneSignal.init({ appId: ONESIGNAL_APP_ID });
+    // GitHub Pages project sites (like this one) serve from a subdirectory,
+    // e.g. https://mattmasindo.github.io/BATTLE-RIVER-SCRIPT/ \u2014 not the
+    // domain root. OneSignal's default init() assumes the service worker
+    // lives at the domain root (/OneSignalSDKWorker.js) unless told
+    // otherwise, so without this the subscription silently never completes,
+    // even though the browser's own notification permission is granted.
+    // Computed from the current path (rather than hardcoded) so this keeps
+    // working correctly even if the repo is ever renamed or moved.
+    var scope = location.pathname.substring(0, location.pathname.lastIndexOf("/") + 1) || "/";
+    OneSignal.init({
+      appId: ONESIGNAL_APP_ID,
+      serviceWorkerPath: "OneSignalSDKWorker.js",
+      serviceWorkerParam: { scope: scope }
+    });
   });
 }
  
