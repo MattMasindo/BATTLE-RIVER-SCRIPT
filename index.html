@@ -676,14 +676,17 @@ async function callBumpMetric(entry) {
   } catch (e) { return false; }
 }
  
-// Fire-and-forget from the caller's point of view: tries once immediately,
-// and if that fails, queues for the next flush (on load, on reconnect, and
-// on the same periodic interval the rest of this app already uses).
+// Returns a real status instead of firing blind, so callers (specifically
+// the Appointments Set toast) can tell the advisor the truth rather than
+// always claiming success. "no_code" is a distinct, actionable case: it
+// means this advisor's roster row has no code assigned yet, which can
+// only be fixed by a manager (Dashboard -> Manager tab), not by retrying.
 async function bumpDashboardMetric(code, field, delta) {
-  if (!code) return; // advisor's code hasn't loaded yet — see fetchAdvisorCode backfill
+  if (!code) return { ok: false, reason: "no_code" };
   var entry = { code: code, date: phTodayStr(), field: field, delta: delta };
   var ok = await callBumpMetric(entry);
-  if (!ok) setPendingBumps(getPendingBumps().concat([entry]));
+  if (!ok) { setPendingBumps(getPendingBumps().concat([entry])); return { ok: false, reason: "queued" }; }
+  return { ok: true };
 }
  
 var bumpFlushInFlight = false;
@@ -1200,6 +1203,11 @@ function App() {
   var searchState = useState(""); var search = searchState[0], setSearch = searchState[1];
   var sortState = useState(lget("br-sort", "stale")); var sortMode = sortState[0], setSortMode = sortState[1];
   var toastState = useState(null); var toast = toastState[0], setToast = toastState[1];
+  // Holds the most recently removed conversation for a few seconds so
+  // deletion can be undone — the cloud-side tombstone already protects
+  // this either way, this just makes that protection visible and
+  // immediately actionable instead of an unexplained instant delete.
+  var undoState = useState(null); var undoInfo = undoState[0], setUndoInfo = undoState[1];
   var syncMetaState = useState(defaultSyncMeta()); var syncMeta = syncMetaState[0], setSyncMetaState = syncMetaState[1];
   var restoreOfferState = useState(null); var restoreOffer = restoreOfferState[0], setRestoreOffer = restoreOfferState[1];
   var prospectsState = useState([]); var prospects = prospectsState[0], setProspects = prospectsState[1];
@@ -1417,8 +1425,11 @@ function App() {
       // dedupe — this is meant to reflect actual script engagement.
       bumpDashboardMetric(advisor.code, "approaching", 1);
       if (justConfirmedAppt) {
-        bumpDashboardMetric(advisor.code, "appts", 1);
-        flash("Logged to your Dashboard \u2014 Appointments Set +1");
+        bumpDashboardMetric(advisor.code, "appts", 1).then(function (res) {
+          if (res.ok) flash("Logged to your Dashboard \u2014 Appointments Set +1");
+          else if (res.reason === "no_code") flash("Couldn't log to Dashboard \u2014 ask your manager to assign you a code");
+          else flash("Appointments Set +1 \u2014 will sync to your Dashboard once back online");
+        });
       }
     }
   }
@@ -1436,10 +1447,31 @@ function App() {
   }
  
   function removeConvo(id) {
+    var removed = null;
+    for (var i = 0; i < convos.length; i++) { if (convos[i].id === id) removed = convos[i]; }
+    if (!removed) return;
     setConvos(convos.filter(function (c) { return c.id !== id; }));
     if (activeId === id) setActiveId(null);
     markDeleted(advisor.id, id);
     refreshSyncMeta();
+ 
+    if (undoInfo && undoInfo.timer) clearTimeout(undoInfo.timer);
+    var timer = setTimeout(function () { setUndoInfo(null); }, 5000);
+    setUndoInfo({ convo: removed, timer: timer });
+  }
+ 
+  // Un-tombstones by re-marking the conversation dirty — the next sync
+  // upserts it back with deleted_at cleared, same as any other edit.
+  // Works whether or not the delete had already reached the server.
+  function undoRemove() {
+    if (!undoInfo) return;
+    var convo = undoInfo.convo;
+    clearTimeout(undoInfo.timer);
+    setUndoInfo(null);
+    setConvos([convo].concat(convos));
+    markDirty(advisor.id, convo.id);
+    refreshSyncMeta();
+    flash("Restored " + convo.name);
   }
  
   // Deliberately one field. No forced category, no source, no phone
@@ -1569,6 +1601,21 @@ function App() {
     className: "px-5 py-2.5 rounded-full text-sm font-semibold shadow-lg"
   }, toast.msg)) : null;
  
+  var undoBannerEl = undoInfo ? h("div", {
+    className: "fixed left-0 right-0 flex justify-center z-50 px-5",
+    style: { bottom: "calc(28px + env(safe-area-inset-bottom))" }
+  }, h("div", {
+    style: { background: C.surface, borderColor: C.gold },
+    className: "border rounded-full pl-5 pr-2 py-2 shadow-lg flex items-center gap-3 max-w-full"
+  },
+    h("span", { className: "text-sm truncate" }, "Removed " + undoInfo.convo.name),
+    h("button", {
+      onClick: undoRemove,
+      style: { background: C.gold, color: "#06223B" },
+      className: "px-4 py-2 rounded-full text-sm font-bold shrink-0 active:scale-95 transition-transform"
+    }, "Undo")
+  )) : null;
+ 
   // Floating quick-add: available from any screen (home, names, settings,
   // even mid-conversation), because the moment an advisor thinks of a
   // name doesn't wait for them to navigate anywhere first. Deliberately
@@ -1595,7 +1642,7 @@ function App() {
         onDone: function (identity) { setPendingAdvisor(null); handleAdvisorSelected(identity); },
         onCancel: function () { setPendingAdvisor(null); }
       }),
-      toastEl
+      toastEl, undoBannerEl
     );
   }
  
@@ -1608,7 +1655,7 @@ function App() {
         onPendingRegistration: setPendingAdvisor,
         onCancel: advisor ? function () { setScreen("settings"); } : null
       }),
-      toastEl
+      toastEl, undoBannerEl
     );
   }
  
@@ -1624,7 +1671,7 @@ function App() {
         onSyncProspectsNow: syncProspectsNow,
         onCheckProspectRestore: checkProspectRestoreManually
       }),
-      toastEl, fabEl, quickAddSheetEl
+      toastEl, undoBannerEl, fabEl, quickAddSheetEl
     );
   }
  
@@ -1636,7 +1683,7 @@ function App() {
         onAdded: handleAdvisorAdded,
         onCancel: function () { setScreen("home"); }
       }),
-      toastEl
+      toastEl, undoBannerEl
     );
   }
  
@@ -1650,7 +1697,7 @@ function App() {
         onPromote: promoteProspect, onRemove: removeProspect,
         restoreOffer: prospectRestoreOffer, onRestore: doProspectRestore, onDismissRestore: dismissProspectRestore
       }),
-      toastEl, fabEl, quickAddSheetEl
+      toastEl, undoBannerEl, fabEl, quickAddSheetEl
     );
   }
  
@@ -1668,13 +1715,13 @@ function App() {
         onQuickAdd: function () { setQuickAddOpen(true); },
         onAddAdvisor: function () { setScreen("add-advisor"); }
       }),
-      toastEl, quickAddSheetEl
+      toastEl, undoBannerEl, quickAddSheetEl
     );
   }
  
   return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
     h(StepScreen, { convo: active, onGo: goTo, onHome: function () { setActiveId(null); }, onFlash: flash, onTouch: touch }),
-    toastEl, fabEl, quickAddSheetEl
+    toastEl, undoBannerEl, fabEl, quickAddSheetEl
   );
 }
  
@@ -2344,6 +2391,50 @@ function PendingApprovalScreen(props) {
   );
 }
  
+// Self-diagnosing status for the Dashboard activity auto-log (New
+// Prospects / Chat Script Usage / Appointments Set). Exists specifically
+// so "why isn't my activity showing on the Dashboard" has a visible
+// answer instead of failing silently — the most likely real-world cause
+// is a missing advisor code, which only a manager can fix.
+function ActivityLogStatusCard(props) {
+  var advisor = props.advisor;
+  var pendingState = useState(getPendingBumps().length); var pendingCount = pendingState[0], setPendingCount = pendingState[1];
+  var syncingState = useState(false); var syncing = syncingState[0], setSyncing = syncingState[1];
+ 
+  useEffect(function () {
+    setPendingCount(getPendingBumps().length);
+  }, []);
+ 
+  function syncNow() {
+    if (syncing) return;
+    setSyncing(true);
+    flushPendingBumps().then(function () {
+      setSyncing(false);
+      setPendingCount(getPendingBumps().length);
+    });
+  }
+ 
+  var hasCode = !!(advisor && advisor.code);
+ 
+  return h("div", null,
+    h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" }, "Dashboard activity log"),
+    h("div", { style: { background: C.surface, borderColor: C.line }, className: "rounded-2xl border p-4 mb-6" },
+      !hasCode
+        ? h("div", { style: { color: "#F5A38C" }, className: "text-[13px] leading-relaxed mb-3" },
+            "No advisor code assigned yet \u2014 New Prospects, Chat Script Usage, and Appointments Set can't reach your Dashboard until a manager assigns you one (Dashboard \u2192 Manager tab).")
+        : h("div", { className: "text-[13px] mb-3" },
+            pendingCount > 0
+              ? pendingCount + " activity update" + (pendingCount === 1 ? "" : "s") + " waiting to sync"
+              : "Up to date"),
+      hasCode && h("button", {
+        onClick: syncNow, disabled: syncing,
+        style: { background: C.gold, color: "#06223B", opacity: syncing ? 0.6 : 1 },
+        className: "w-full py-2.5 rounded-xl text-sm font-bold active:scale-[0.98] transition-transform"
+      }, syncing ? "Syncing\u2026" : "Sync now")
+    )
+  );
+}
+ 
 function SettingsScreen(props) {
   var advisor = props.advisor, convos = props.convos, meta = props.syncMeta;
  
@@ -2433,6 +2524,8 @@ function SettingsScreen(props) {
           }, "Restore from cloud")
         )
       ),
+ 
+      h(ActivityLogStatusCard, { advisor: advisor }),
  
       isOneSignalConfigured() && h("div", null,
         h("div", { style: { color: C.muted }, className: "text-[11px] font-mono uppercase tracking-widest mb-2.5" }, "Daily overdue digest"),
