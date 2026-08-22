@@ -435,6 +435,46 @@ var STEPS = {
 // These must never sit at the top of the follow-up queue.
 var FINISHED = { done: true, pass_sunlife: true };
  
+// Progress toward a set appointment, from 0 (opener) to 100 (appt_confirm).
+// Once the appointment is actually confirmed, everything after it —
+// presenting the plan, forms, closing — stays at 100. This bar is
+// specifically "did we get the appointment," not "how far into the whole
+// sale are we," so it intentionally doesn't keep climbing past that point.
+// Chase/park steps sit slightly below the step they're chasing toward, so
+// the bar doesn't look identical to real forward progress.
+var STEP_PROGRESS = {
+  start: 0,
+  seen_opener: 5,
+  explain_payout: 15,
+  has_plan: 15,
+  other_company: 20,
+  pass_sunlife: 20,
+  ask_details: 30,
+  chase_details: 35,
+  got_details: 50,
+  chase_appt: 55,
+  appt_day: 60,
+  appt_weekday: 70,
+  appt_weekend: 70,
+  appt_time: 85,
+  appt_confirm: 100,
+  present_intro: 100,
+  benefit_life: 100,
+  benefit_disability: 100,
+  benefit_payout: 100,
+  questions: 100,
+  chase_present: 100,
+  forms: 100,
+  chase_forms: 100,
+  close_bank: 100,
+  close_payment: 100,
+  done: 100
+};
+function scriptProgress(stepKey) {
+  var v = STEP_PROGRESS[stepKey];
+  return v == null ? 0 : v;
+}
+ 
 function daysSince(ts) { return Math.floor((Date.now() - ts) / 86400000); }
  
 function fmtAgo(ts) {
@@ -1660,7 +1700,16 @@ function HomeScreen(props) {
                   className: "text-[11px] font-mono shrink-0" + (level === "high" ? " font-semibold" : "")
                 }, fmtAgo(c.updated))
               ),
-              h("div", { className: "flex items-center gap-2 mt-1 min-w-0" },
+              h("div", { style: { background: C.line }, className: "w-full h-1 rounded-full mt-2 overflow-hidden" },
+                h("div", {
+                  style: {
+                    width: scriptProgress(c.step) + "%",
+                    background: scriptProgress(c.step) >= 100 ? C.good : C.gold
+                  },
+                  className: "h-full rounded-full"
+                })
+              ),
+              h("div", { className: "flex items-center gap-2 mt-1.5 min-w-0" },
                 h("span", { style: { background: stage.color, width: "7px", height: "7px", borderRadius: "50%", display: "inline-block", flexShrink: 0 } }),
                 h("span", { style: { color: C.muted }, className: "text-xs truncate" }, step.title)
               )
