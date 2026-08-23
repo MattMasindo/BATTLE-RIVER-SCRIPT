@@ -2773,7 +2773,18 @@ function SettingsScreen(props) {
         "This device is identified as " + (advisor ? advisor.name : "no one") +
         " by name only — there's no password. Anyone with access to this device could pick a different name. Treat this as attribution, not account security."),
  
-      h("div", { style: { color: C.line }, className: "text-[10px] font-mono text-center mt-8 mb-2" }, "BRU Script " + APP_VERSION)
+      h("div", { style: { color: C.muted }, className: "text-[11px] font-mono text-center leading-relaxed mt-8" },
+        "Built by Matthew Isaiah Masindo",
+        h("br"),
+        "Business Systems Architect \u00b7 Financial Advisor \u00b7 Unit Manager"
+      ),
+      h("div", { style: { color: C.muted }, className: "text-[11px] font-mono text-center leading-relaxed mt-3 mb-2" },
+        "With suggestions from Karl Matthew Espinosa",
+        h("br"),
+        "Missionary \u00b7 Financial Advisor \u00b7 Friend"
+      ),
+ 
+      h("div", { style: { color: C.line }, className: "text-[10px] font-mono text-center mt-4 mb-2" }, "BRU Script " + APP_VERSION)
     )
   );
 }
