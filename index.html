@@ -100,7 +100,7 @@ function isOneSignalConfigured() {
   return ONESIGNAL_APP_ID.indexOf("YOUR-ONESIGNAL") === -1;
 }
  
-var APP_VERSION = "1.3.4-onesignal-configured";
+var APP_VERSION = "1.4.0-patch4-instrumentation";
  
 function isSupabaseConfigured() {
   return SUPABASE_URL.indexOf("YOUR-PROJECT") === -1 && SUPABASE_ANON_KEY.indexOf("YOUR-ANON") === -1;
@@ -667,6 +667,47 @@ function phTodayStr() {
 var PENDING_BUMPS_KEY = "br-pending-metric-bumps";
 function getPendingBumps() { return lget(PENDING_BUMPS_KEY, []); }
 function setPendingBumps(list) { lset(PENDING_BUMPS_KEY, list); }
+ 
+// ======================================================================
+// PATCH 4 — COACHING INSTRUMENTATION.
+//
+// Writes fire-and-forget rows to the SAME public.usage_events table the
+// Dashboard already writes to (insert-only under the anon policy), so no
+// SQL migration accompanies this patch.
+//
+// Purpose is funnel-leak diagnosis for the weekly 1-on-1: which step does
+// each advisor's conversations stall or die at. It is NOT a verification
+// or anti-fraud mechanism and must not be presented to advisors as one.
+//
+// PRIVACY: client and prospect NAMES are never sent. Only opaque
+// client-generated ids, step keys, and stage names go into meta. Prospect
+// names are third-party personal data and usage_events is readable far
+// more broadly than conversation_backups.
+//
+// Same convention as every other network call in this file: never throws,
+// never blocks, never surfaces an error to the advisor. Telemetry failing
+// silently is correct; telemetry breaking the script is not.
+// ======================================================================
+function launchMode() {
+  try {
+    if (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) return "standalone";
+    if (window.navigator && window.navigator.standalone) return "standalone"; // iOS Safari home-screen launch
+  } catch (e) {}
+  return "browser";
+}
+ 
+var sessionEventLogged = false;
+ 
+function logEvent(eventType, advisorCode, meta) {
+  try {
+    if (!supabaseClient) return;
+    supabaseClient.from("usage_events").insert({
+      event_type: eventType,
+      advisor_code: advisorCode || null,
+      meta: meta || null
+    }).then(function () {}, function () {});
+  } catch (e) { /* telemetry must never break the app */ }
+}
  
 async function callBumpMetric(entry) {
   if (!supabaseClient) return false;
@@ -1334,6 +1375,21 @@ function App() {
   useEffect(function () { lset("br-sort", sortMode); }, [sortMode]);
   useEffect(function () { lset("br-names-sort", namesSortMode); }, [namesSortMode]);
  
+  // One session_start per page load, fired only once the advisor's code is
+  // known — an event with a null advisor_code can't be attributed to anyone
+  // and would just be noise in the table. Guarded by a module-scope flag
+  // (not a ref) because "once per page load" is exactly module-scope
+  // lifetime, and this file only imports useState/useEffect from React.
+  useEffect(function () {
+    if (sessionEventLogged) return;
+    if (!advisor || !advisor.code) return;
+    sessionEventLogged = true;
+    logEvent("script_session_start", advisor.code, {
+      launch_mode: launchMode(),
+      app_version: APP_VERSION
+    });
+  }, [advisor && advisor.code]);
+ 
   // Backfills `code` onto an advisor identity cached on this device before
   // this feature shipped — needed to call the Dashboard's bump_metric()
   // RPC for the activity auto-log below. No-ops once code is already
@@ -1504,15 +1560,18 @@ function App() {
     setSearch("");
     markDirty(advisor.id, convo.id);
     refreshSyncMeta();
+    logEvent("script_convo_started", advisor.code, { convo_id: convo.id, source: "new" });
   }
  
   function goTo(stepKey) {
     if (stepKey === "home") { setActiveId(null); return; }
     var changedId = null;
     var justConfirmedAppt = false;
+    var fromStep = null;
     setConvos(convos.map(function (c) {
       if (c.id !== activeId) return c;
       changedId = c.id;
+      fromStep = c.step;
       // Guarded by the conversation's own apptLogged flag (synced across
       // devices via conversation_backups), not by comparing old/new step —
       // so revisiting or restarting a conversation can never double-bump
@@ -1526,7 +1585,17 @@ function App() {
       // Chat Script Usage: every genuine step advance, no cap, no
       // dedupe — this is meant to reflect actual script engagement.
       bumpDashboardMetric(advisor.code, "approaching", 1);
+      // Coaching instrumentation: from/to is what makes funnel-leak
+      // analysis possible. `fromStep` is read off the pre-update convo,
+      // never off `activeId`'s post-render state.
+      logEvent("script_step_advanced", advisor.code, {
+        convo_id: changedId,
+        from: fromStep,
+        to: stepKey,
+        to_stage: (STEPS[stepKey] && STEPS[stepKey].stage) || null
+      });
       if (justConfirmedAppt) {
+        logEvent("script_appt_confirmed", advisor.code, { convo_id: changedId });
         bumpDashboardMetric(advisor.code, "appts", 1).then(function (res) {
           if (res.ok) flash("Logged to your Dashboard \u2014 Appointments Set +1");
           else if (res.reason === "no_code") flash("Couldn't log to Dashboard \u2014 ask your manager to assign you a code");
@@ -1538,14 +1607,27 @@ function App() {
  
   // Copying a line means it got sent — on the "chase" steps the advisor
   // stays put, so without this the conversation would look untouched.
-  function touch() {
+  function touch(optionIdx) {
     var changedId = null;
+    var atStep = null;
     setConvos(convos.map(function (c) {
       if (c.id !== activeId) return c;
       changedId = c.id;
+      atStep = c.step;
       return Object.assign({}, c, { updated: Date.now() });
     }));
-    if (changedId) { markDirty(advisor.id, changedId); refreshSyncMeta(); }
+    if (changedId) {
+      markDirty(advisor.id, changedId);
+      refreshSyncMeta();
+      // A copy is the closest thing this app has to proof a line was
+      // actually sent — a far better coaching signal than a step advance,
+      // which can happen without anything being sent to anybody.
+      logEvent("script_line_copied", advisor.code, {
+        convo_id: changedId,
+        step: atStep,
+        option: typeof optionIdx === "number" ? optionIdx : null
+      });
+    }
   }
  
   function removeConvo(id) {
@@ -1556,6 +1638,9 @@ function App() {
     if (activeId === id) setActiveId(null);
     markDeleted(advisor.id, id);
     refreshSyncMeta();
+    // Where conversations DIE is the sharpest coaching signal in the app —
+    // a cluster of removals at one step names the exact skill to work on.
+    logEvent("script_convo_removed", advisor.code, { convo_id: id, step: removed.step });
  
     if (undoInfo && undoInfo.timer) clearTimeout(undoInfo.timer);
     var timer = setTimeout(function () { setUndoInfo(null); }, 5000);
@@ -1593,6 +1678,8 @@ function App() {
     setQuickAddOpen(false);
     flash(dupe ? "Added \u2014 similar name already on your list" : "Added to your names list");
     bumpDashboardMetric(advisor.code, "prospecting", 1);
+    // id only, never the name — see the PRIVACY note on logEvent.
+    logEvent("script_prospect_added", advisor.code, { prospect_id: prospect.id, duplicate: !!dupe });
   }
  
   // Promoting is just starting a normal conversation at step "start" —
@@ -1615,6 +1702,13 @@ function App() {
  
     setActiveId(convo.id);
     setScreen("home");
+    // days_waiting answers a question the counts can't: how long names sit
+    // on the list before anyone actually works them.
+    logEvent("script_convo_started", advisor.code, {
+      convo_id: convo.id,
+      source: "promoted",
+      days_waiting: p.created ? Math.floor((now - p.created) / 86400000) : null
+    });
   }
  
   function removeProspect(id) {
@@ -2802,7 +2896,7 @@ function StepScreen(props) {
       if (ok) {
         setCopiedIdx(idx);
         setTimeout(function () { setCopiedIdx(null); }, 1800);
-        if (onTouch) onTouch();
+        if (onTouch) onTouch(idx);
         onFlash("Copied \u2014 paste sa Messenger");
       } else {
         onFlash("Couldn't copy \u2014 long-press the text instead");
