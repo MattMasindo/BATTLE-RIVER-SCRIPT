@@ -36,6 +36,19 @@
   .font-mono { font-family: 'IBM Plex Mono', monospace; }
   @keyframes flash { 0% { opacity: 0; transform: translateY(6px); } 15% { opacity: 1; transform: translateY(0); } 85% { opacity: 1; } 100% { opacity: 0; } }
   .flash { animation: flash 1.6s ease forwards; }
+  /* Patch 5 — bottom sheet mechanics (Rule 14). sheetIn is the open
+     animation; sheet-settle is the spring-back applied only when a drag
+     ENDS below the dismiss threshold, so it never fights the finger. */
+  @keyframes sheetIn { from { transform: translateY(100%); } to { transform: translateY(0); } }
+  .sheet-in { animation: sheetIn 0.22s cubic-bezier(0.32, 0.72, 0, 1); }
+  .sheet-settle { transition: transform 0.22s cubic-bezier(0.32, 0.72, 0, 1); }
+  /* The drag handle owns the gesture. touch-action:none stops the browser
+     claiming the vertical swipe as a page scroll before we see it. */
+  .sheet-grip { touch-action: none; -webkit-user-select: none; user-select: none; }
+  /* Deep-linked target gets a brief gold pulse so the advisor's eye lands
+     on the right card instead of hunting for it. */
+  @keyframes deepPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(240,176,64,0); } 30% { box-shadow: 0 0 0 3px rgba(240,176,64,0.55); } }
+  .deep-pulse { animation: deepPulse 1.8s ease 2; }
 </style>
 </head>
 <body>
@@ -45,7 +58,7 @@
 (function () {
 "use strict";
 var h = React.createElement;
-var useState = React.useState, useEffect = React.useEffect;
+var useState = React.useState, useEffect = React.useEffect, useLayoutEffect = React.useLayoutEffect;
  
 var C = {
   bg: "#061A2E", surface: "#0D2740", surfaceAlt: "#133150",
@@ -100,7 +113,7 @@ function isOneSignalConfigured() {
   return ONESIGNAL_APP_ID.indexOf("YOUR-ONESIGNAL") === -1;
 }
  
-var APP_VERSION = "1.4.0-patch4-instrumentation";
+var APP_VERSION = "1.5.0-patch5-ux";
  
 function isSupabaseConfigured() {
   return SUPABASE_URL.indexOf("YOUR-PROJECT") === -1 && SUPABASE_ANON_KEY.indexOf("YOUR-ANON") === -1;
@@ -1303,6 +1316,230 @@ function exportProspectsCSV(advisor, prospects) {
   );
 }
  
+// ======================================================================
+// PATCH 5 — UX RULES (Jakob's Law + hard interaction rules 6, 8, 9,
+// 12, 14, 15). Nothing in this section touches STEPS, STAGES, the
+// 26-step flow, sync, instrumentation, or any Dashboard bump.
+//
+// Rules 11 (optimistic UI) and 13 (JIT permissions) were already
+// satisfied by the existing code and are deliberately left alone:
+// every write is local-first with a background outbox, and the
+// notification prompt only ever fires inside the Settings button's own
+// click stack (see enableDigestPush's Safari note).
+// ======================================================================
+ 
+// ---------------------------------------------------------------------
+// RULE 8 — scroll position retention.
+//
+// Every screen in this app is a conditional render of one document, so
+// there is a single scrolling element (the window) shared by all of
+// them. Remembered per route key, restored on return.
+//
+// scrollY is sampled continuously rather than read at navigation time
+// on purpose: by the time a layout effect runs, the new screen's DOM is
+// already in place and a shorter screen will have made the browser
+// clamp scrollY to its own height — which would silently record the
+// wrong position for the screen being left.
+// ---------------------------------------------------------------------
+var scrollStore = {};
+var lastScrollY = 0;
+var prevRouteKey = null;
+ 
+function currentScrollY() {
+  try { return window.scrollY || window.pageYOffset || 0; } catch (e) { return 0; }
+}
+ 
+function scrollToTop(smooth) {
+  try {
+    if (smooth && typeof window.scrollTo === "function") { window.scrollTo({ top: 0, behavior: "smooth" }); }
+    else { window.scrollTo(0, 0); }
+  } catch (e) { try { window.scrollTo(0, 0); } catch (e2) {} }
+  lastScrollY = 0;
+}
+ 
+// ---------------------------------------------------------------------
+// RULE 15 — deep linking.
+//
+// Parsed once at module load, BEFORE React mounts, so a link that
+// arrives while the app is cold still resolves. Held until the advisor
+// is known and their conversations have actually been read off
+// localStorage — resolving earlier would report "not on this device"
+// for a conversation that simply hadn't loaded yet.
+//
+// Supported:
+//   ?convo=<id>      — open that conversation directly
+//   ?prospect=<id>   — Names tab, scrolled to and highlighting that name
+//   ?tab=chats|names|settings
+//   ?view=overdue    — Chats tab sorted by "Needs follow-up"
+//                      (this is the one the daily digest push should use)
+// ---------------------------------------------------------------------
+function parseDeepLink() {
+  try {
+    var qs = null;
+    if (typeof URLSearchParams === "function") qs = new URLSearchParams(window.location.search);
+    if (!qs) return null;
+    var convo = qs.get("convo");
+    if (convo) return { kind: "convo", id: convo };
+    var prospect = qs.get("prospect");
+    if (prospect) return { kind: "prospect", id: prospect };
+    var view = qs.get("view");
+    if (view === "overdue") return { kind: "overdue" };
+    var tab = qs.get("tab");
+    if (tab === "names" || tab === "settings" || tab === "chats") return { kind: "tab", tab: tab };
+    return null;
+  } catch (e) { return null; }
+}
+ 
+var PENDING_DEEP_LINK = parseDeepLink();
+ 
+// Keeps the address bar honest so any screen can be copied and shared,
+// and so a reload lands back where the advisor actually was. replaceState
+// (not push) — route changes already manage their own history entries
+// via navPush() below, and doubling up would break the back button.
+function syncUrl(tab, convoId, prospectId) {
+  try {
+    if (!window.history || !window.history.replaceState) return;
+    var q = "";
+    if (convoId) q = "?convo=" + encodeURIComponent(convoId);
+    else if (prospectId) q = "?prospect=" + encodeURIComponent(prospectId);
+    else if (tab && tab !== "chats") q = "?tab=" + encodeURIComponent(tab);
+    window.history.replaceState(window.history.state, "", window.location.pathname + q);
+  } catch (e) {}
+}
+ 
+// ---------------------------------------------------------------------
+// RULE 6 — back navigates exactly one screen.
+//
+// One history entry is pushed per layer opened. popstate pops whatever
+// the deepest visible layer currently is, so the hardware/browser back
+// button and the on-screen ← button run the identical code path and
+// can never disagree. Deliberately order-independent: if the stack ever
+// desyncs (a shared link, a restored tab), back still closes the
+// topmost thing rather than throwing the advisor out of the app.
+// ---------------------------------------------------------------------
+var navDepth = 0;
+ 
+function navPush() {
+  try {
+    if (!window.history || !window.history.pushState) return;
+    navDepth++;
+    window.history.pushState({ brDepth: navDepth }, "");
+  } catch (e) {}
+}
+ 
+// ---------------------------------------------------------------------
+// RULE 12 — draft auto-saving. Keyed per advisor, same as every other
+// local bucket in this file, so a device changing hands never shows one
+// advisor a half-typed name belonging to another.
+// ---------------------------------------------------------------------
+function draftKey(advisorId, field) { return "br-draft-" + field + "-" + advisorId; }
+ 
+function getDraft(advisorId, field) {
+  if (!advisorId) return "";
+  var v = lget(draftKey(advisorId, field), "");
+  return typeof v === "string" ? v : "";
+}
+ 
+function setDraft(advisorId, field, value) {
+  if (!advisorId) return;
+  if (value) { lset(draftKey(advisorId, field), value); return; }
+  try { localStorage.removeItem(draftKey(advisorId, field)); } catch (e) {}
+}
+ 
+var draftLoadedFor = null;
+ 
+// ---------------------------------------------------------------------
+// Shared navigation controls (Rule 6). One ← and one ✕, used
+// everywhere, so "go back one screen" and "close this flow" always look
+// and behave the same. 40px square clears the 44px-ish touch target once
+// the surrounding padding is counted.
+// ---------------------------------------------------------------------
+function BackBtn(props) {
+  return h("button", {
+    onClick: props.onClick,
+    style: { color: C.muted, borderColor: C.line },
+    className: "w-10 h-10 shrink-0 rounded-full border flex items-center justify-center text-lg active:opacity-60 " + (props.className || ""),
+    "aria-label": props.label || "Back"
+  }, "←");
+}
+ 
+function CloseBtn(props) {
+  return h("button", {
+    onClick: props.onClick,
+    style: { color: C.muted, borderColor: C.line },
+    className: "w-10 h-10 shrink-0 rounded-full border flex items-center justify-center text-lg active:opacity-60 " + (props.className || ""),
+    "aria-label": props.label || "Close"
+  }, "✕");
+}
+ 
+// ---------------------------------------------------------------------
+// RULE 9 — bottom tab bar. Chats / Names / Settings, the three
+// destinations an advisor actually moves between. Tapping the tab you
+// are already on returns to that tab's root and scrolls to the top,
+// which is the behavior every phone user already has muscle memory for.
+// ---------------------------------------------------------------------
+function TabIcon(props) {
+  var common = {
+    viewBox: "0 0 24 24", width: 22, height: 22, fill: "none",
+    stroke: "currentColor", strokeWidth: 1.8,
+    strokeLinecap: "round", strokeLinejoin: "round",
+    style: { display: "block" }
+  };
+  if (props.name === "chats") {
+    return h("svg", common, h("path", { d: "M21 11.5a8.5 8.5 0 01-8.5 8.5 8.4 8.4 0 01-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 01-.9-3.8 8.5 8.5 0 018.5-8.5h.5a8.5 8.5 0 018 8v.5z" }));
+  }
+  if (props.name === "names") {
+    return h("svg", common,
+      h("path", { d: "M8 6h13M8 12h13M8 18h13" }),
+      h("path", { d: "M3.5 6h.01M3.5 12h.01M3.5 18h.01" })
+    );
+  }
+  return h("svg", common,
+    h("circle", { cx: "12", cy: "12", r: "3" }),
+    h("path", { d: "M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z" })
+  );
+}
+ 
+function BottomTabs(props) {
+  var tabs = [
+    { key: "chats", label: "Chats", badge: props.overdueCount },
+    { key: "names", label: "Names", badge: 0 },
+    { key: "settings", label: "Settings", badge: 0 }
+  ];
+  return h("div", {
+    style: {
+      background: C.surface, borderColor: C.line,
+      paddingBottom: "env(safe-area-inset-bottom)"
+    },
+    className: "fixed bottom-0 left-0 right-0 border-t z-40",
+    role: "navigation",
+    "aria-label": "Main"
+  },
+    h("div", { className: "max-w-md mx-auto flex" },
+      tabs.map(function (t) {
+        var on = props.active === t.key;
+        return h("button", {
+          key: t.key,
+          onClick: function () { props.onSelect(t.key); },
+          style: { color: on ? C.gold : C.muted },
+          className: "flex-1 py-2.5 flex flex-col items-center gap-1 active:opacity-60",
+          "aria-label": t.label,
+          "aria-current": on ? "page" : null
+        },
+          h("div", { className: "relative" },
+            h(TabIcon, { name: t.key }),
+            t.badge > 0 && h("span", {
+              style: { background: urgencyColor("high"), color: "#fff", minWidth: "16px" },
+              className: "absolute -top-1.5 -right-2 h-4 px-1 rounded-full text-[10px] font-mono font-semibold flex items-center justify-center"
+            }, t.badge > 99 ? "99+" : String(t.badge))
+          ),
+          h("span", { className: "text-[10px] font-mono tracking-wide" + (on ? " font-semibold" : "") }, t.label)
+        );
+      })
+    )
+  );
+}
+ 
 function App() {
   var advisorState = useState(lget("br-advisor", null)); var advisor = advisorState[0], setAdvisor = advisorState[1];
   // A self-registered ("I'm new here") advisor waiting on manager approval.
@@ -1330,6 +1567,13 @@ function App() {
   var quickAddState = useState(false); var quickAddOpen = quickAddState[0], setQuickAddOpen = quickAddState[1];
   var namesSortState = useState(lget("br-names-sort", "stale")); var namesSortMode = namesSortState[0], setNamesSortMode = namesSortState[1];
   var namesSearchState = useState(""); var namesSearch = namesSearchState[0], setNamesSearch = namesSearchState[1];
+ 
+  // Patch 5. `convosReady` gates deep-link resolution (see parseDeepLink):
+  // a ?convo= link must not be judged "not on this device" before the
+  // local list has actually been read. `highlightProspect` is the Names
+  // card a ?prospect= link landed on.
+  var convosReadyState = useState(false); var convosReady = convosReadyState[0], setConvosReady = convosReadyState[1];
+  var highlightState = useState(null); var highlightProspect = highlightState[0], setHighlightProspect = highlightState[1];
  
   function flash(msg) {
     setToast({ msg: msg, id: Date.now() });
@@ -1368,6 +1612,7 @@ function App() {
     }
     setConvos(loaded);
     setActiveId(null);
+    setConvosReady(true);
     refreshSyncMeta();
     // eslint-disable-next-line
   }, [advisor && advisor.id]);
@@ -1521,6 +1766,154 @@ function App() {
     // eslint-disable-next-line
   }, [advisor && advisor.id, prospects.length]);
  
+  // -------------------------------------------------------------------
+  // Patch 5 runtime. `screen` still carries the same values it always
+  // has; "home" / "names" / "settings" are simply now reachable as tabs
+  // as well, so no existing navigation call site had to change meaning.
+  // -------------------------------------------------------------------
+  var currentTab = screen === "names" ? "names" : (screen === "settings" ? "settings" : "chats");
+  var tabsVisible = (screen === "home" || screen === "names" || screen === "settings") && !!advisor;
+  var routeKey = screen === "names" ? "names"
+    : screen === "settings" ? "settings"
+    : screen === "home" ? (activeId ? "convo:" + activeId : "chats")
+    : screen;
+ 
+  var overdueCount = 0;
+  convos.forEach(function (c) { if (urgency(c) === "high") overdueCount++; });
+ 
+  // Rule 8. Sampled continuously so the position recorded for the screen
+  // being left is the advisor's real one, not a value the browser has
+  // already clamped against the incoming screen's height.
+  useEffect(function () {
+    function onScroll() { lastScrollY = currentScrollY(); }
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return function () { window.removeEventListener("scroll", onScroll); };
+  }, []);
+ 
+  useLayoutEffect(function () {
+    if (prevRouteKey !== null && prevRouteKey !== routeKey) scrollStore[prevRouteKey] = lastScrollY;
+    prevRouteKey = routeKey;
+    var target = scrollStore[routeKey] || 0;
+    window.scrollTo(0, target);
+    lastScrollY = target;
+    // Second pass after paint: a list whose images/fonts settle late can
+    // grow after the synchronous restore, leaving the first scrollTo short.
+    var raf = null;
+    try { raf = window.requestAnimationFrame(function () { window.scrollTo(0, target); lastScrollY = target; }); } catch (e) {}
+    return function () { if (raf) { try { window.cancelAnimationFrame(raf); } catch (e) {} } };
+  }, [routeKey]);
+ 
+  // Rule 15. Keeps the URL matching the visible screen so it can be
+  // shared or reloaded into the same place.
+  // Each tab keeps its own navigation stack (an open conversation is still
+  // open when you come back to Chats), so the URL must describe the tab
+  // you can actually SEE — not a conversation parked behind another tab.
+  useEffect(function () {
+    if (!advisor) return;
+    syncUrl(
+      currentTab,
+      currentTab === "chats" ? activeId : null,
+      currentTab === "names" ? highlightProspect : null
+    );
+  }, [routeKey, highlightProspect, advisor && advisor.id]);
+ 
+  // Rule 6. The single place a "back" of any origin is resolved —
+  // hardware back, browser back, on-screen ← and ✕ all land here,
+  // so they can never disagree about what one screen back means.
+  function popLayer() {
+    if (!advisor) return false;                      // first-run identity must stay blocking
+    if (quickAddOpen) { setQuickAddOpen(false); return true; }
+    if (screen === "onboarding") { finishOnboarding(); return true; }
+    if (screen === "identity" || screen === "add-advisor") { setScreen("home"); return true; }
+    if (activeId) { setActiveId(null); return true; }
+    if (screen === "names" || screen === "settings") { setScreen("home"); return true; }
+    return false;
+  }
+ 
+  function goBack() {
+    if (navDepth > 0) { try { window.history.back(); return; } catch (e) {} }
+    popLayer();
+  }
+ 
+  useEffect(function () {
+    function onPop() {
+      if (navDepth > 0) navDepth--;
+      popLayer();
+    }
+    window.addEventListener("popstate", onPop);
+    return function () { window.removeEventListener("popstate", onPop); };
+  });
+ 
+  // Rule 9. Tapping the active tab returns to that tab's root and goes to
+  // the top; tapping a different tab switches to it, restoring wherever
+  // that tab was last left (Rule 8).
+  function selectTab(t) {
+    if (t === currentTab) {
+      if (t === "chats" && activeId) { goBack(); }
+      scrollStore[routeKey] = 0;
+      scrollToTop(true);
+      return;
+    }
+    navPush();
+    setScreen(t === "chats" ? "home" : t);
+  }
+ 
+  function openConvo(id) {
+    navPush();
+    setActiveId(id);
+  }
+ 
+  function openQuickAdd() {
+    navPush();
+    setQuickAddOpen(true);
+  }
+ 
+  // Rule 12. Loaded per advisor, then written back on every keystroke, so
+  // navigating away mid-entry (or the OS killing a backgrounded tab)
+  // never costs a half-typed name.
+  useEffect(function () {
+    if (!advisor) { draftLoadedFor = null; return; }
+    draftLoadedFor = advisor.id;
+    setNewName(getDraft(advisor.id, "newname"));
+    // eslint-disable-next-line
+  }, [advisor && advisor.id]);
+ 
+  useEffect(function () {
+    if (!advisor) return;
+    if (draftLoadedFor !== advisor.id) return;
+    setDraft(advisor.id, "newname", newName);
+  }, [newName, advisor && advisor.id]);
+ 
+  // Rule 15 resolution. Runs once, only after identity AND the local
+  // conversation list are both settled, and never on top of a blocking
+  // flow (first-run picker, pending approval, onboarding).
+  useEffect(function () {
+    if (!PENDING_DEEP_LINK) return;
+    if (!advisor || pendingAdvisor) return;
+    if (!convosReady) return;
+    if (screen === "onboarding") return;
+    var dl = PENDING_DEEP_LINK;
+    PENDING_DEEP_LINK = null;
+    var resolved = true;
+    if (dl.kind === "convo") {
+      var found = false;
+      for (var i = 0; i < convos.length; i++) { if (convos[i].id === dl.id) found = true; }
+      if (found) { setScreen("home"); setActiveId(dl.id); }
+      else { resolved = false; setScreen("home"); flash("That conversation isn't on this device"); }
+    } else if (dl.kind === "prospect") {
+      setScreen("names");
+      setHighlightProspect(dl.id);
+    } else if (dl.kind === "overdue") {
+      setScreen("home");
+      setActiveId(null);
+      setSortMode("stale");
+    } else if (dl.kind === "tab") {
+      setScreen(dl.tab === "chats" ? "home" : dl.tab);
+    }
+    logEvent("script_deeplink_opened", advisor.code, { target: dl.kind, resolved: resolved });
+    // eslint-disable-next-line
+  }, [advisor && advisor.id, pendingAdvisor, convosReady, screen]);
+ 
   var active = null;
   for (var i = 0; i < convos.length; i++) { if (convos[i].id === activeId) active = convos[i]; }
  
@@ -1555,8 +1948,10 @@ function App() {
     var now = Date.now();
     var convo = { id: now + "-" + Math.random().toString(36).slice(2, 8), name: nm, step: "start", created: now, updated: now };
     setConvos([convo].concat(convos));
+    navPush();
     setActiveId(convo.id);
     setNewName("");
+    setDraft(advisor.id, "newname", "");
     setSearch("");
     markDirty(advisor.id, convo.id);
     refreshSyncMeta();
@@ -1564,7 +1959,9 @@ function App() {
   }
  
   function goTo(stepKey) {
-    if (stepKey === "home") { setActiveId(null); return; }
+    // "park muna" choices close the conversation — routed through the
+    // same one-screen-back path as ← so the history entry is consumed.
+    if (stepKey === "home") { goBack(); return; }
     var changedId = null;
     var justConfirmedAppt = false;
     var fromStep = null;
@@ -1675,7 +2072,8 @@ function App() {
     setProspects([prospect].concat(prospects));
     markProspectDirty(advisor.id, prospect.id);
     refreshProspectSyncMeta();
-    setQuickAddOpen(false);
+    setDraft(advisor.id, "quickadd", "");
+    if (quickAddOpen) goBack(); else setQuickAddOpen(false);
     flash(dupe ? "Added \u2014 similar name already on your list" : "Added to your names list");
     bumpDashboardMetric(advisor.code, "prospecting", 1);
     // id only, never the name — see the PRIVACY note on logEvent.
@@ -1700,6 +2098,7 @@ function App() {
     markProspectDeleted(advisor.id, id);
     refreshProspectSyncMeta();
  
+    navPush();
     setActiveId(convo.id);
     setScreen("home");
     // days_waiting answers a question the counts can't: how long names sit
@@ -1791,7 +2190,7 @@ function App() {
   var toastEl = toast ? h("div", {
     key: toast.id,
     className: "flash fixed left-0 right-0 flex justify-center z-50",
-    style: { bottom: "calc(28px + env(safe-area-inset-bottom))", pointerEvents: "none" }
+    style: { bottom: tabsVisible ? "calc(5.5rem + env(safe-area-inset-bottom))" : "calc(28px + env(safe-area-inset-bottom))", pointerEvents: "none" }
   }, h("div", {
     style: { background: C.gold, color: "#06223B" },
     className: "px-5 py-2.5 rounded-full text-sm font-semibold shadow-lg"
@@ -1799,7 +2198,7 @@ function App() {
  
   var undoBannerEl = undoInfo ? h("div", {
     className: "fixed left-0 right-0 flex justify-center z-50 px-5",
-    style: { bottom: "calc(28px + env(safe-area-inset-bottom))" }
+    style: { bottom: tabsVisible ? "calc(5.5rem + env(safe-area-inset-bottom))" : "calc(28px + env(safe-area-inset-bottom))" }
   }, h("div", {
     style: { background: C.surface, borderColor: C.gold },
     className: "border rounded-full pl-5 pr-2 py-2 shadow-lg flex items-center gap-3 max-w-full"
@@ -1818,16 +2217,27 @@ function App() {
   // NOT a screen — it's an overlay, so whatever they were doing is still
   // exactly where they left it once they close it.
   var fabEl = h("button", {
-    onClick: function () { setQuickAddOpen(true); },
-    style: { background: C.gold, color: "#06223B", bottom: "calc(1.5rem + env(safe-area-inset-bottom))" },
+    onClick: openQuickAdd,
+    style: { background: C.gold, color: "#06223B", bottom: tabsVisible ? "calc(5.25rem + env(safe-area-inset-bottom))" : "calc(1.5rem + env(safe-area-inset-bottom))" },
     className: "fixed right-5 z-40 w-14 h-14 rounded-full shadow-lg flex items-center justify-center text-3xl font-bold active:scale-95 transition-transform",
     "aria-label": "Quick-add a prospect"
   }, "+");
  
   var quickAddSheetEl = quickAddOpen ? h(QuickAddSheet, {
+    advisorId: advisor && advisor.id,
     onSave: addProspect,
-    onClose: function () { setQuickAddOpen(false); }
+    onClose: goBack
   }) : null;
+ 
+  var tabsEl = tabsVisible ? h(BottomTabs, {
+    active: currentTab, onSelect: selectTab, overdueCount: overdueCount
+  }) : null;
+ 
+  // Content has to clear the fixed tab bar; anything without tabs keeps
+  // its original spacing.
+  var shellStyle = tabsVisible
+    ? { background: C.bg, minHeight: "100vh", color: C.text, paddingBottom: "calc(4.5rem + env(safe-area-inset-bottom))" }
+    : { background: C.bg, minHeight: "100vh", color: C.text };
  
   if (pendingAdvisor) {
     return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
@@ -1849,7 +2259,7 @@ function App() {
         currentName: advisor && advisor.name,
         onSelect: handleAdvisorSelected,
         onPendingRegistration: setPendingAdvisor,
-        onCancel: advisor ? function () { setScreen("settings"); } : null
+        onCancel: advisor ? goBack : null
       }),
       toastEl, undoBannerEl
     );
@@ -1862,20 +2272,20 @@ function App() {
   }
  
   if (screen === "settings") {
-    return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
+    return h("div", { style: shellStyle },
       h(SettingsScreen, {
         advisor: advisor, convos: convos, syncMeta: syncMeta,
         prospects: prospects, prospectSyncMeta: prospectSyncMeta,
         onBack: function () { setScreen("home"); },
-        onChangeIdentity: function () { setScreen("identity"); },
+        onChangeIdentity: function () { navPush(); setScreen("identity"); },
         onSyncNow: syncNow,
         onCheckRestore: checkRestoreManually,
         onSyncProspectsNow: syncProspectsNow,
         onCheckProspectRestore: checkProspectRestoreManually,
         onFlash: flash,
-        onShowTour: function () { setScreen("onboarding"); }
+        onShowTour: function () { navPush(); setScreen("onboarding"); }
       }),
-      toastEl, undoBannerEl, fabEl, quickAddSheetEl
+      toastEl, undoBannerEl, fabEl, quickAddSheetEl, tabsEl
     );
   }
  
@@ -1885,47 +2295,48 @@ function App() {
         mode: "add-advisor",
         startExpanded: true,
         onAdded: handleAdvisorAdded,
-        onCancel: function () { setScreen("home"); }
+        onCancel: goBack
       }),
       toastEl, undoBannerEl
     );
   }
  
   if (screen === "names") {
-    return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
+    return h("div", { style: shellStyle },
       h(NamesListScreen, {
         prospects: prospects,
         search: namesSearch, setSearch: setNamesSearch,
         sortMode: namesSortMode, setSortMode: setNamesSortMode,
-        onBack: function () { setScreen("home"); },
         onPromote: promoteProspect, onRemove: removeProspect,
+        highlightId: highlightProspect,
+        onHighlightSeen: function () { setHighlightProspect(null); },
         restoreOffer: prospectRestoreOffer, onRestore: doProspectRestore, onDismissRestore: dismissProspectRestore
       }),
-      toastEl, undoBannerEl, fabEl, quickAddSheetEl
+      toastEl, undoBannerEl, fabEl, quickAddSheetEl, tabsEl
     );
   }
  
   if (!active) {
-    return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
+    return h("div", { style: shellStyle },
       h(HomeScreen, {
         convos: convos, newName: newName, setNewName: setNewName,
         search: search, setSearch: setSearch,
         sortMode: sortMode, setSortMode: setSortMode,
-        onStart: startNew, onOpen: setActiveId, onRemove: removeConvo,
-        onOpenSettings: function () { setScreen("settings"); },
+        onStart: startNew, onOpen: openConvo, onRemove: removeConvo,
+        onOpenSettings: function () { selectTab("settings"); },
         restoreOffer: restoreOffer, onRestore: doRestore, onDismissRestore: dismissRestore,
         prospectCount: prospects.length,
-        onOpenNames: function () { setScreen("names"); },
-        onQuickAdd: function () { setQuickAddOpen(true); },
-        onAddAdvisor: function () { setScreen("add-advisor"); }
+        onOpenNames: function () { selectTab("names"); },
+        onQuickAdd: openQuickAdd,
+        onAddAdvisor: function () { navPush(); setScreen("add-advisor"); }
       }),
-      toastEl, undoBannerEl, quickAddSheetEl
+      toastEl, undoBannerEl, quickAddSheetEl, tabsEl
     );
   }
  
-  return h("div", { style: { background: C.bg, minHeight: "100vh", color: C.text } },
-    h(StepScreen, { convo: active, onGo: goTo, onHome: function () { setActiveId(null); }, onFlash: flash, onTouch: touch }),
-    toastEl, undoBannerEl, fabEl, quickAddSheetEl
+  return h("div", { style: shellStyle },
+    h(StepScreen, { convo: active, onGo: goTo, onHome: goBack, onFlash: flash, onTouch: touch }),
+    toastEl, undoBannerEl, fabEl, quickAddSheetEl, tabsEl
   );
 }
  
@@ -2125,42 +2536,90 @@ function HomeScreen(props) {
 // with zero navigation. One field, on purpose: no category, no source,
 // no phone number. Anything beyond a name is friction.
 function QuickAddSheet(props) {
-  var nameState = useState(""); var name = nameState[0], setName = nameState[1];
+  // Rule 12: the field opens holding whatever was last typed into it and
+  // never lost, including across a close, a tab switch, or a reload.
+  var nameState = useState(function () { return getDraft(props.advisorId, "quickadd"); });
+  var name = nameState[0], setName = nameState[1];
+  // Rule 14: dragY is the live finger offset; settling is only true for
+  // the spring-back after a release that didn't clear the threshold, so
+  // the CSS transition never fights the drag itself.
+  var dragState = useState(0); var dragY = dragState[0], setDragY = dragState[1];
+  var settleState = useState(false); var settling = settleState[0], setSettling = settleState[1];
+ 
+  function updateName(v) {
+    setName(v);
+    setDraft(props.advisorId, "quickadd", v);
+  }
  
   function save() { props.onSave(name); }
+ 
+  // Pointer handlers live on the grip strip alone, and window listeners
+  // (not setPointerCapture) carry the move/up. Capturing the pointer on a
+  // sheet header silently swallows taps on controls inside that header —
+  // the ✕ would stop responding.
+  function onGripDown(ev) {
+    var startY = ev.clientY;
+    var moved = 0;
+    setSettling(false);
+ 
+    function onMove(e) {
+      moved = e.clientY - startY;
+      if (moved < 0) moved = 0;               // upward drag does nothing
+      setDragY(moved);
+    }
+    function onUp() {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      if (moved > 90) { props.onClose(); return; }
+      setSettling(true);
+      setDragY(0);
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  }
  
   return h("div", { className: "fixed inset-0 z-50 flex items-end justify-center" },
     h("div", {
       onClick: props.onClose,
       className: "absolute inset-0",
-      style: { background: "rgba(6,26,46,0.7)" }
+      style: { background: "rgba(6,26,46,0.7)", opacity: Math.max(0.25, 1 - dragY / 260) }
     }),
     h("div", {
-      style: { background: C.surface, borderColor: C.line },
-      className: "relative w-full max-w-md rounded-t-3xl border-t border-x p-5 pb-7"
+      style: {
+        background: C.surface, borderColor: C.line,
+        transform: dragY ? "translateY(" + dragY + "px)" : null,
+        paddingBottom: "calc(1.75rem + env(safe-area-inset-bottom))"
+      },
+      className: "relative w-full max-w-md rounded-t-3xl border-t border-x px-5 pb-7 " +
+        (dragY ? "" : (settling ? "sheet-settle" : "sheet-in"))
     },
-      h("div", { style: { color: C.gold }, className: "text-[10px] tracking-[0.28em] uppercase font-mono mb-3" }, "Quick add"),
+      h("div", {
+        onPointerDown: onGripDown,
+        className: "sheet-grip w-full pt-3 pb-1 flex justify-center cursor-grab",
+        "aria-label": "Drag down to close"
+      }, h("div", { style: { background: C.line }, className: "w-10 h-1.5 rounded-full" })),
+ 
+      h("div", { className: "flex items-center justify-between mb-3" },
+        h("div", { style: { color: C.gold }, className: "text-[10px] tracking-[0.28em] uppercase font-mono" }, "Quick add"),
+        h(CloseBtn, { onClick: props.onClose, label: "Close quick add" })
+      ),
+ 
       h("input", {
         autoFocus: true,
         value: name,
-        onChange: function (ev) { setName(ev.target.value); },
+        onChange: function (ev) { updateName(ev.target.value); },
         onKeyDown: function (ev) { if (ev.key === "Enter") save(); },
         placeholder: "Prospect's name",
         style: { background: C.bg, borderColor: C.line, color: C.text },
         className: "w-full px-4 py-3 rounded-xl border outline-none text-base mb-3"
       }),
-      h("div", { className: "flex gap-2" },
-        h("button", {
-          onClick: save,
-          style: { background: C.gold, color: "#06223B" },
-          className: "flex-1 py-3.5 rounded-xl font-bold active:scale-[0.98] transition-transform"
-        }, "Save"),
-        h("button", {
-          onClick: props.onClose,
-          style: { color: C.muted },
-          className: "px-5 py-3.5 text-sm font-mono active:opacity-60"
-        }, "Cancel")
-      )
+      h("button", {
+        onClick: save,
+        style: { background: C.gold, color: "#06223B" },
+        className: "w-full py-3.5 rounded-xl font-bold active:scale-[0.98] transition-transform"
+      }, "Save")
     )
   );
 }
@@ -2172,6 +2631,22 @@ function QuickAddSheet(props) {
 // as a conversation going stale, just one step earlier in the funnel.
 function NamesListScreen(props) {
   var prospects = props.prospects;
+ 
+  // Rule 15. A ?prospect= deep link has to land on the card itself, not
+  // on the top of a list the advisor then has to search. Cleared after
+  // one pass so the pulse doesn't replay on every later render.
+  useEffect(function () {
+    if (!props.highlightId) return;
+    var t = setTimeout(function () {
+      try {
+        var el = document.getElementById("br-prospect-" + props.highlightId);
+        if (el && el.scrollIntoView) el.scrollIntoView({ block: "center" });
+      } catch (e) {}
+    }, 60);
+    var clear = setTimeout(function () { if (props.onHighlightSeen) props.onHighlightSeen(); }, 4200);
+    return function () { clearTimeout(t); clearTimeout(clear); };
+  }, [props.highlightId]);
+ 
   var q = props.search.trim().toLowerCase();
   var sorted = sortConvos(prospects, props.sortMode);
   var shown = q
@@ -2190,7 +2665,6 @@ function NamesListScreen(props) {
       style: { background: C.surface, borderColor: C.line, top: "env(safe-area-inset-top)" },
       className: "px-5 pt-5 pb-4 border-b sticky top-0 z-10"
     },
-      h("button", { onClick: props.onBack, style: { color: C.muted }, className: "text-sm font-mono active:opacity-60 mb-3" }, "\u2039 all chats"),
       h("div", { className: "flex items-center justify-between" },
         h("div", { className: "font-display text-2xl" }, "Names List"),
         needFollowUp > 0 && h("div", {
@@ -2251,10 +2725,12 @@ function NamesListScreen(props) {
         shown.map(function (p) {
           var level = urgency(p);
           var uColor = urgencyColor(level);
+          var isTarget = props.highlightId === p.id;
           return h("div", {
             key: p.id,
-            style: { background: C.surface, borderColor: level === "high" ? uColor : C.line },
-            className: "rounded-2xl border flex items-stretch overflow-hidden"
+            id: "br-prospect-" + p.id,
+            style: { background: C.surface, borderColor: isTarget ? C.gold : (level === "high" ? uColor : C.line) },
+            className: "rounded-2xl border flex items-stretch overflow-hidden" + (isTarget ? " deep-pulse" : "")
           },
             h("div", { className: "flex-1 px-4 py-3.5 min-w-0" },
               h("div", { className: "flex items-baseline justify-between gap-3" },
@@ -2363,11 +2839,14 @@ function IdentityScreen(props) {
   return h("div", { className: "max-w-md mx-auto px-5 pt-10 pb-16" },
     h("div", { className: "flex items-center gap-3.5 mb-8" },
       h(Shield, { size: 44, uid: "identity" }),
-      h("div", null,
+      h("div", { className: "min-w-0 flex-1" },
         h("div", { style: { color: C.gold }, className: "text-[10px] tracking-[0.28em] uppercase font-mono mb-0.5" }, "Battle River Unit"),
         h("div", { className: "font-display text-[22px] leading-tight" },
           props.mode === "change" ? "Change identity" : props.mode === "add-advisor" ? "Add a new advisor" : "Who's using this device?")
-      )
+      ),
+      // Rule 6: an ✕ is the explicit way out of any flow that can be
+      // left. First-run has no ✕ on purpose — there is nothing behind it.
+      props.onCancel && h(CloseBtn, { onClick: props.onCancel, label: "Close" })
     ),
  
     props.mode === "first-run" && h("div", { style: { color: C.muted }, className: "text-[13px] leading-relaxed mb-6" },
@@ -2462,11 +2941,9 @@ function IdentityScreen(props) {
     // decides server-side whether this call is a first-time "create" or a
     // real "compare".
     pinTarget && h("div", null,
-      h("button", {
-        onClick: function () { setPinTarget(null); },
-        style: { color: C.muted },
-        className: "text-sm font-mono active:opacity-60 mb-4"
-      }, "\u2039 back"),
+      h("div", { className: "mb-4" },
+        h(BackBtn, { onClick: function () { setPinTarget(null); }, label: "Back to the advisor list" })
+      ),
  
       h("div", { style: { color: C.muted }, className: "text-[13px] leading-relaxed mb-4" },
         "Enter the PIN for " + pinTarget.name + ". If this is the first time anyone has signed in as them, whatever you type here becomes their PIN going forward \u2014 make sure it's really " + pinTarget.name + " typing it."),
@@ -2495,11 +2972,7 @@ function IdentityScreen(props) {
       }, pinBusy ? "Checking\u2026" : "Continue")
     ),
  
-    props.onCancel && h("button", {
-      onClick: props.onCancel,
-      style: { color: C.muted },
-      className: "w-full mt-2 py-3 text-sm font-mono active:opacity-60"
-    }, "cancel")
+    null
   );
 }
  
@@ -2675,11 +3148,9 @@ function OnboardingScreen(props) {
   },
     h("div", { className: "flex items-center justify-between mb-10" },
       h(Shield, { size: 40, uid: "onboarding" }),
-      h("button", {
-        onClick: props.onFinish,
-        style: { color: C.muted },
-        className: "text-sm font-mono active:opacity-60"
-      }, "Skip")
+      // Rule 6: ✕ closes the whole wizard, ← (below) steps back
+      // exactly one slide. Two distinct controls, never conflated.
+      h(CloseBtn, { onClick: props.onFinish, label: "Skip the tour" })
     ),
  
     h("div", { className: "flex-1 flex flex-col items-center justify-center text-center px-2" },
@@ -2704,11 +3175,9 @@ function OnboardingScreen(props) {
       className: "w-full py-3.5 rounded-xl font-bold active:scale-[0.98] transition-transform"
     }, isLast ? "Get started" : "Next"),
  
-    step > 0 && h("button", {
-      onClick: function () { setStep(step - 1); },
-      style: { color: C.muted },
-      className: "w-full mt-3 py-2 text-sm font-mono active:opacity-60"
-    }, "back")
+    step > 0 && h("div", { className: "flex justify-center mt-3" },
+      h(BackBtn, { onClick: function () { setStep(step - 1); }, label: "Previous slide" })
+    )
   );
 }
  
@@ -2751,7 +3220,6 @@ function SettingsScreen(props) {
       style: { background: C.surface, borderColor: C.line, top: "env(safe-area-inset-top)" },
       className: "px-5 pt-5 pb-4 border-b sticky top-0 z-10"
     },
-      h("button", { onClick: props.onBack, style: { color: C.muted }, className: "text-sm font-mono active:opacity-60 mb-3" }, "‹ all chats"),
       h("div", { className: "font-display text-2xl" }, "Settings")
     ),
  
@@ -2910,7 +3378,7 @@ function StepScreen(props) {
       className: "px-5 pt-5 pb-4 border-b sticky top-0 z-10"
     },
       h("div", { className: "flex items-center justify-between mb-3" },
-        h("button", { onClick: onHome, style: { color: C.muted }, className: "text-sm font-mono active:opacity-60" }, "\u2039 all chats"),
+        h(BackBtn, { onClick: onHome, label: "Back to all chats" }),
         h("div", { className: "flex items-center gap-1.5" },
           h("span", { style: { background: stage.color, width: "7px", height: "7px", borderRadius: "50%", display: "inline-block" } }),
           h("span", { style: { color: stage.color }, className: "text-[11px] font-mono uppercase tracking-wider" }, stage.label)
